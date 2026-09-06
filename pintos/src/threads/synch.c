@@ -275,10 +275,7 @@ cond_init (struct condition *cond)
    the condition after the wait completes and, if necessary, wait
    again.
 
-   A given condition variable is associated with only a single
-   lock, but one lock may be associated with any number of
-   condition variables.  That is, there is a one-to-many mapping
-   from locks to condition variables.
+    
 
    This function may sleep, so it must not be called within an
    interrupt handler.  This function may be called with

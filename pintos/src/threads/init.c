@@ -40,7 +40,6 @@
 
 /* Page directory with kernel mappings only. */
 uint32_t *init_page_dir;
-
 #ifdef FILESYS
 /* -f: Format the file system? */
 static bool format_filesys;
@@ -69,6 +68,92 @@ static void usage (void);
 static void locate_block_devices (void);
 static void locate_block_device (enum block_type, const char *name);
 #endif
+
+/* Reads a line of user input from keyboard using input_getc(). */
+static void
+read_line (char *line, size_t max_size)
+{
+  size_t i = 0;
+  while (true)
+    {
+      uint8_t c = input_getc ();
+
+      /* Handle Enter / Return key */
+      if (c == '\r' || c == '\n')
+        {
+          putchar ('\n');
+          line[i] = '\0';
+          break;
+        }
+      /* Handle Backspace key */
+      else if (c == '\b' || c == 127)
+        {
+          if (i > 0)
+            {
+              i--;
+              printf ("\b \b");
+            }
+        }
+      /* Handle printable characters */
+      else if (c >= 32 && c <= 126)
+        {
+          if (i < max_size - 1)
+            {
+              line[i++] = c;
+              putchar (c);
+            }
+        }
+    }
+}
+
+/* Runs the CS2042 interactive kernel shell. */
+static void
+run_shell (void)
+{
+  char line[128];
+
+  while (true)
+    {
+      printf ("CS2042> ");
+      read_line (line, sizeof line);
+
+      if (line[0] == '\0')
+        continue;
+
+      if (!strcmp (line, "whoami"))
+        {
+          printf ("240449A Nethul Nanayakkara\n");
+        }
+      else if (!strcmp (line, "shutdown"))
+        {
+          shutdown_power_off ();
+        }
+      else if (!strcmp (line, "time"))
+        {
+          printf ("%"PRIu32" seconds\n", (uint32_t) rtc_get_time ());
+        }
+      else if (!strcmp (line, "ram"))
+        {
+          printf ("%"PRIu32" kB RAM\n", (uint32_t) (init_ram_pages * PGSIZE / 1024));
+        }
+      else if (!strcmp (line, "thread"))
+        {
+          thread_print_stats ();
+        }
+      else if (!strcmp (line, "priority"))
+        {
+          printf ("%d\n", thread_get_priority ());
+        }
+      else if (!strcmp (line, "exit"))
+        {
+          break;
+        }
+      else
+        {
+          printf ("Unknown command: %s\n", line);
+        }
+    }
+}
 
 int pintos_init (void) NO_RETURN;
 
@@ -133,7 +218,8 @@ pintos_init (void)
     /* Run actions specified on kernel command line. */
     run_actions (argv);
   } else {
-    // TODO: no command line passed to kernel. Run interactively 
+    /* No command line passed to kernel. Run interactively */
+    run_shell ();
   }
 
   /* Finish up. */

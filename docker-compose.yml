@@ -1,0 +1,9 @@
+services:
+  pintos:
+    image: pintos
+    container_name: pintos_dev
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./pintos/src:/pintos/src
+    working_dir: /pintos/src/threads

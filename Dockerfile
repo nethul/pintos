@@ -47,7 +47,7 @@ RUN dos2unix /pintos/src/misc/toolchain-build.sh
 RUN mkdir -p /pintos/toolchain
 
 # build Bochs from source
-RUN pintos/src/misc/bochs-2.6.2-build.sh /pintos/toolchain/x86_64
+RUN /pintos/src/misc/bochs-2.6.2-build.sh /pintos/toolchain/x86_64
 
 # Build the toolchain with a custom prefix
 RUN /pintos/src/misc/toolchain-build.sh --prefix /pintos/toolchain/x86_64 /pintos/toolchain && \

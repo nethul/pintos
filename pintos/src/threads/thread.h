@@ -5,6 +5,8 @@
 #include <list.h>
 #include <stdint.h>
 
+#include "threads/fixed-point.h"
+
 /* States in a thread's life cycle. */
 enum thread_status {
   THREAD_RUNNING, /* Running thread. */
@@ -99,6 +101,9 @@ struct thread {
   uint32_t *pagedir; /* Page directory. */
 #endif
 
+  int nice;                  /* Niceness (-20 to 20). */
+  fp_t recent_cpu;           /* Recent CPU consumption (17.14 fixed-point). */
+
   /* Owned by thread.c. */
   unsigned magic; /* Detects stack overflow. */
 };
@@ -134,9 +139,19 @@ void thread_foreach(thread_action_func *, void *);
 int thread_get_priority(void);
 void thread_set_priority(int);
 
+bool thread_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *aux);
+void thread_donate_priority(struct thread *donor);
+void thread_recompute_priority(struct thread *t);
+void thread_test_preemption(void);
+
 int thread_get_nice(void);
 void thread_set_nice(int);
 int thread_get_recent_cpu(void);
 int thread_get_load_avg(void);
+
+void thread_mlfqs_update_priority(struct thread *t);
+void thread_mlfqs_update_all_priorities(void);
+void thread_mlfqs_update_load_avg(void);
+void thread_mlfqs_update_all_recent_cpu(void);
 
 #endif /* threads/thread.h */

@@ -101,8 +101,8 @@ struct thread {
   uint32_t *pagedir; /* Page directory. */
 #endif
 
-  int nice;                  /* Niceness (-20 to 20). */
-  fp_t recent_cpu;           /* Recent CPU consumption (17.14 fixed-point). */
+  int nice;        /* Niceness (-20 to 20). */
+  fp_t recent_cpu; /* Recent CPU consumption (17.14 fixed-point). */
 
   /* Owned by thread.c. */
   unsigned magic; /* Detects stack overflow. */
@@ -139,7 +139,8 @@ void thread_foreach(thread_action_func *, void *);
 int thread_get_priority(void);
 void thread_set_priority(int);
 
-bool thread_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *aux);
+bool thread_cmp_priority(const struct list_elem *a, const struct list_elem *b,
+                         void *aux);
 void thread_donate_priority(struct thread *donor);
 void thread_recompute_priority(struct thread *t);
 void thread_test_preemption(void);

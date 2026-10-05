@@ -1,4 +1,5 @@
 #include "threads/thread.h"
+#include "devices/timer.h"
 #include "threads/flags.h"
 #include "threads/interrupt.h"
 #include "threads/intr-stubs.h"
@@ -11,7 +12,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
-#include "devices/timer.h"
+
 
 #ifdef USERPROG
 #include "userprog/process.h"
@@ -237,8 +238,7 @@ void thread_block(void) {
 /* Returns true if the thread 'a' has higher priority than the thread 'b'.
    Used by list_insert_ordered() to insert threads into lists in
    descending order of priority. */
-bool thread_cmp_priority(const struct list_elem *a,
-                         const struct list_elem *b,
+bool thread_cmp_priority(const struct list_elem *a, const struct list_elem *b,
                          void *aux UNUSED) {
   struct thread *t1 = list_entry(a, struct thread, elem);
   struct thread *t2 = list_entry(b, struct thread, elem);
@@ -327,8 +327,7 @@ void thread_yield(void) {
 
   old_level = intr_disable();
   if (cur != idle_thread)
-    list_insert_ordered(&ready_list, &cur->elem, thread_cmp_priority,
-                        NULL);
+    list_insert_ordered(&ready_list, &cur->elem, thread_cmp_priority, NULL);
   cur->status = THREAD_READY;
   schedule();
   intr_set_level(old_level);
@@ -379,7 +378,8 @@ void thread_donate_priority(struct thread *donor) {
       /* If holder is on ready_list, re-insert to maintain sorted order */
       if (holder->status == THREAD_READY) {
         list_remove(&holder->elem);
-        list_insert_ordered(&ready_list, &holder->elem, thread_cmp_priority, NULL);
+        list_insert_ordered(&ready_list, &holder->elem, thread_cmp_priority,
+                            NULL);
       }
     }
 
@@ -433,7 +433,8 @@ void thread_mlfqs_update_priority(struct thread *t) {
     return;
 
   /* priority = PRI_MAX - (recent_cpu / 4) - (nice * 2) */
-  int prio = PRI_MAX - fp_to_int_round(fp_div_int(t->recent_cpu, 4)) - (t->nice * 2);
+  int prio =
+      PRI_MAX - fp_to_int_round(fp_div_int(t->recent_cpu, 4)) - (t->nice * 2);
   if (prio > PRI_MAX)
     prio = PRI_MAX;
   if (prio < PRI_MIN)

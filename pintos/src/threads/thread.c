@@ -346,6 +346,23 @@ void thread_foreach(thread_action_func *func, void *aux) {
   }
 }
 
+/* Returns the thread with the given TID, or NULL if no such thread exists. */
+struct thread *thread_get_by_tid(tid_t tid) {
+  struct list_elem *e;
+  enum intr_level old_level = intr_disable();
+
+  for (e = list_begin(&all_list); e != list_end(&all_list); e = list_next(e)) {
+    struct thread *t = list_entry(e, struct thread, allelem);
+    if (t->tid == tid) {
+      intr_set_level(old_level);
+      return t;
+    }
+  }
+
+  intr_set_level(old_level);
+  return NULL;
+}
+
 /* Yields the CPU if there is a higher-priority thread waiting on ready_list. */
 void thread_test_preemption(void) {
   if (!list_empty(&ready_list)) {
@@ -606,6 +623,12 @@ static void init_thread(struct thread *t, const char *name, int priority) {
   t->base_priority = priority;
   t->waiting_on = NULL;
   list_init(&t->locks_held);
+
+#ifdef USERPROG
+  sema_init(&t->wait_sema, 0);
+  t->exited = false;
+  t->exit_status = -1;
+#endif
 
   if (thread_mlfqs) {
     if (t == initial_thread) {

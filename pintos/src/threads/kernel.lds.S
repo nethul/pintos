@@ -12,16 +12,17 @@ SECTIONS
   . = _start + SIZEOF_HEADERS;
 
   /* Kernel starts with code, followed by read-only data and writable data. */
-  .text : { *(.start) *(.text) } = 0x90
+  .text : { *(.start) *(.text) *(.text.*) } = 0x90
   .rodata : { *(.rodata) *(.rodata.*) 
 	      . = ALIGN(0x1000); 
 	      _end_kernel_text = .; }
-  .data : { *(.data) 
+  .eh_frame : { *(.eh_frame) }
+  .data : { *(.data) *(.data.*) *(.data.rel.ro*) *(.data.rel.local*) *(.got*)
 	    _signature = .; LONG(0xaa55aa55) }
 
   /* BSS (zero-initialized data) is after everything else. */
   _start_bss = .;
-  .bss : { *(.bss) }
+  .bss : { *(.bss) *(.bss.*) *(COMMON) }
   _end_bss = .;
 
   _end = .;

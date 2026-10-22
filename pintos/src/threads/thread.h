@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "threads/fixed-point.h"
+#include "threads/synch.h"
 
 /* States in a thread's life cycle. */
 enum thread_status {
@@ -98,7 +99,10 @@ struct thread {
 
 #ifdef USERPROG
   /* Owned by userprog/process.c. */
-  uint32_t *pagedir; /* Page directory. */
+  uint32_t *pagedir;          /* Page directory. */
+  struct semaphore wait_sema; /* Synchronizes parent wait with child exit. */
+  bool exited;                /* Has the process exited? */
+  int exit_status;            /* Process termination exit status. */
 #endif
 
   int nice;        /* Niceness (-20 to 20). */
@@ -135,6 +139,7 @@ void thread_yield(void);
 /* Performs some operation on thread t, given auxiliary data AUX. */
 typedef void thread_action_func(struct thread *t, void *aux);
 void thread_foreach(thread_action_func *, void *);
+struct thread *thread_get_by_tid(tid_t tid);
 
 int thread_get_priority(void);
 void thread_set_priority(int);

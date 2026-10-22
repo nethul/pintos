@@ -19,8 +19,11 @@
 #include <string.h>
 
 
+#define MAX_ARGS 64
+
 static thread_func start_process NO_RETURN;
 static bool load(const char *cmdline, void (**eip)(void), void **esp);
+static bool setup_stack(void **esp, int argc, char *argv[]);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -37,8 +40,14 @@ tid_t process_execute(const char *file_name) {
     return TID_ERROR;
   strlcpy(fn_copy, file_name, PGSIZE);
 
+  /* Extract program name (first word) to name the thread. */
+  char thread_name[16];
+  char *save_ptr;
+  strlcpy(thread_name, file_name, sizeof thread_name);
+  strtok_r(thread_name, " ", &save_ptr);
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create(file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create(thread_name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
     palloc_free_page(fn_copy);
   return tid;
@@ -82,12 +91,30 @@ static void start_process(void *file_name_) {
 
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
-int process_wait(tid_t child_tid UNUSED) { return -1; }
+int process_wait(tid_t child_tid) {
+  struct thread *child = thread_get_by_tid(child_tid);
+  if (child == NULL)
+    return -1;
+
+  /* Block until child exits. */
+  sema_down(&child->wait_sema);
+  return 0;
+}
 
 /* Free the current process's resources. */
 void process_exit(void) {
   struct thread *cur = thread_current();
   uint32_t *pd;
+
+  /* Print termination message for user processes.
+     Only user processes have a user page directory. */
+  if (cur->pagedir != NULL) {
+    printf("%s: exit(%d)\n", cur->name, cur->exit_status);
+  }
+
+  /* Signal waiting parent. */
+  cur->exited = true;
+  sema_up(&cur->wait_sema);
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -181,7 +208,7 @@ struct Elf32_Phdr {
 #define PF_W 2 /* Writable. */
 #define PF_R 4 /* Readable. */
 
-static bool setup_stack(void **esp);
+static bool setup_stack(void **esp, int argc, char *argv[]);
 static bool validate_segment(const struct Elf32_Phdr *, struct file *);
 static bool load_segment(struct file *file, off_t ofs, uint8_t *upage,
                          uint32_t read_bytes, uint32_t zero_bytes,
@@ -199,16 +226,31 @@ bool load(const char *file_name, void (**eip)(void), void **esp) {
   bool success = false;
   int i;
 
+  /* Tokenize the command line into executable name and arguments.
+     We make a local copy because strtok_r modifies the string in place. */
+  char *argv[MAX_ARGS];
+  int argc = 0;
+  char cmdline_copy[256];
+  strlcpy(cmdline_copy, file_name, sizeof cmdline_copy);
+  char *token, *save_ptr;
+  for (token = strtok_r(cmdline_copy, " ", &save_ptr);
+       token != NULL && argc < MAX_ARGS;
+       token = strtok_r(NULL, " ", &save_ptr))
+    argv[argc++] = token;
+
+  if (argc == 0)
+    goto done;
+
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create();
   if (t->pagedir == NULL)
     goto done;
   process_activate();
 
-  /* Open executable file. */
-  file = filesys_open(file_name);
+  /* Open executable file using the program name (argv[0]). */
+  file = filesys_open(argv[0]);
   if (file == NULL) {
-    printf("load: %s: open failed\n", file_name);
+    printf("load: %s: open failed\n", argv[0]);
     goto done;
   }
 
@@ -217,7 +259,7 @@ bool load(const char *file_name, void (**eip)(void), void **esp) {
       memcmp(ehdr.e_ident, "\177ELF\1\1\1", 7) || ehdr.e_type != 2 ||
       ehdr.e_machine != 3 || ehdr.e_version != 1 ||
       ehdr.e_phentsize != sizeof(struct Elf32_Phdr) || ehdr.e_phnum > 1024) {
-    printf("load: %s: error loading executable\n", file_name);
+    printf("load: %s: error loading executable\n", argv[0]);
     goto done;
   }
 
@@ -273,8 +315,8 @@ bool load(const char *file_name, void (**eip)(void), void **esp) {
     }
   }
 
-  /* Set up stack. */
-  if (!setup_stack(esp))
+  /* Set up stack with parsed arguments. */
+  if (!setup_stack(esp, argc, argv))
     goto done;
 
   /* Start address. */
@@ -390,21 +432,84 @@ static bool load_segment(struct file *file, off_t ofs, uint8_t *upage,
   return true;
 }
 
-/* Create a minimal stack by mapping a zeroed page at the top of
-   user virtual memory. */
-static bool setup_stack(void **esp) {
+/* Create the user process initial stack and push command-line arguments
+   following the 32-bit x86 calling convention expected by C main().
+
+   Stack Layout (High Memory to Low Memory):
+     PHYS_BASE  -> [ argv[argc-1] string ... ]
+                   [ ... ]
+                   [ argv[0] string ... ]
+                   [ word-align padding (0..3 bytes) ]
+                   [ argv[argc] = NULL ]
+                   [ argv[argc-1] pointer ]
+                   [ ... ]
+                   [ argv[0] pointer ]
+                   [ argv (pointer to argv[0]) ]
+                   [ argc ]
+     *esp       -> [ fake return address = 0 ]
+*/
+static bool setup_stack(void **esp, int argc, char *argv[]) {
   uint8_t *kpage;
   bool success = false;
 
   kpage = palloc_get_page(PAL_USER | PAL_ZERO);
-  if (kpage != NULL) {
-    success = install_page(((uint8_t *)PHYS_BASE) - PGSIZE, kpage, true);
-    if (success)
-      *esp = PHYS_BASE;
-    else
-      palloc_free_page(kpage);
+  if (kpage == NULL)
+    return false;
+
+  success = install_page(((uint8_t *)PHYS_BASE) - PGSIZE, kpage, true);
+  if (!success) {
+    palloc_free_page(kpage);
+    return false;
   }
-  return success;
+
+  uint8_t *sp = (uint8_t *)PHYS_BASE;
+
+  /* Step 1: Push argument strings in right-to-left order.
+     Record the virtual address of each string on the user stack. */
+  char *arg_addrs[MAX_ARGS];
+  int i;
+  for (i = argc - 1; i >= 0; i--) {
+    size_t len = strlen(argv[i]) + 1; /* include null terminator */
+    sp -= len;
+    memcpy(sp, argv[i], len);
+    arg_addrs[i] = (char *)sp;
+  }
+
+  /* Step 2: Word-align the stack pointer to a 4-byte boundary. */
+  sp = (uint8_t *)((uintptr_t)sp & ~3);
+
+  /* Step 3: Push null sentinel argv[argc] = NULL. */
+  sp -= sizeof(char *);
+  *(char **)sp = NULL;
+
+  /* Step 4: Push pointers to argument strings in right-to-left order
+     so that argv[0] is at the lowest memory address in the array. */
+  for (i = argc - 1; i >= 0; i--) {
+    sp -= sizeof(char *);
+    *(char **)sp = arg_addrs[i];
+  }
+
+  /* Step 5: Push argv (pointer to argv[0]). */
+  char **argv_ptr = (char **)sp;
+  sp -= sizeof(char **);
+  *(char ***)sp = argv_ptr;
+
+  /* Step 6: Push argc. */
+  sp -= sizeof(int);
+  *(int *)sp = argc;
+
+  /* Step 7: Push fake return address (0). */
+  sp -= sizeof(void *);
+  *(void **)sp = NULL;
+
+  /* Sanity check: Ensure stack didn't exceed 1 page. */
+  if (sp < (uint8_t *)PHYS_BASE - PGSIZE) {
+    palloc_free_page(kpage);
+    return false;
+  }
+
+  *esp = sp;
+  return true;
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel

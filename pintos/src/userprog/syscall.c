@@ -1,16 +1,25 @@
 #include "userprog/syscall.h"
 #include "devices/input.h"
 #include "devices/shutdown.h"
+#include "filesys/file.h"
+#include "filesys/filesys.h"
 #include "threads/interrupt.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
 #include <stdio.h>
 #include <syscall-nr.h>
 
+#define MAX_FD 128
+
+/* Global lock to serialize all operations on the unsynchronized Pintos file system. */
+struct lock filesys_lock;
+
 static void syscall_handler(struct intr_frame *);
 
 void syscall_init(void) {
+  lock_init(&filesys_lock);
   intr_register_int(0x30, 3, INTR_ON, syscall_handler, "syscall");
 }
 
@@ -84,6 +93,26 @@ static void validate_args(const void *esp, size_t argc) {
     sys_exit(-1);
 }
 
+/* Allocates the lowest available file descriptor (>= 2) for the current thread. */
+static int allocate_fd(struct file *file) {
+  struct thread *cur = thread_current();
+  int fd;
+  for (fd = 2; fd < MAX_FD; fd++) {
+    if (cur->fd_table[fd] == NULL) {
+      cur->fd_table[fd] = file;
+      return fd;
+    }
+  }
+  return -1;
+}
+
+/* Retrieves the file pointer associated with fd in the current thread's table. */
+static struct file *get_file(int fd) {
+  if (fd < 2 || fd >= MAX_FD)
+    return NULL;
+  return thread_current()->fd_table[fd];
+}
+
 static void syscall_handler(struct intr_frame *f) {
   /* 1. Ensure esp points to valid user memory for the syscall number. */
   if (!is_valid_buffer(f->esp, sizeof(int))) {
@@ -125,33 +154,69 @@ static void syscall_handler(struct intr_frame *f) {
   case SYS_CREATE: {
     validate_args(f->esp, 2);
     const char *file = *(const char **)((char *)f->esp + 4);
+    off_t initial_size = *(off_t *)((char *)f->esp + 8);
+
     if (!is_valid_string(file))
       sys_exit(-1);
-    f->eax = false;
+
+    lock_acquire(&filesys_lock);
+    f->eax = filesys_create(file, initial_size);
+    lock_release(&filesys_lock);
     break;
   }
 
   case SYS_REMOVE: {
     validate_args(f->esp, 1);
     const char *file = *(const char **)((char *)f->esp + 4);
+
     if (!is_valid_string(file))
       sys_exit(-1);
-    f->eax = false;
+
+    lock_acquire(&filesys_lock);
+    f->eax = filesys_remove(file);
+    lock_release(&filesys_lock);
     break;
   }
 
   case SYS_OPEN: {
     validate_args(f->esp, 1);
     const char *file = *(const char **)((char *)f->esp + 4);
+
     if (!is_valid_string(file))
       sys_exit(-1);
-    f->eax = -1;
+
+    lock_acquire(&filesys_lock);
+    struct file *opened = filesys_open(file);
+    lock_release(&filesys_lock);
+
+    if (opened == NULL) {
+      f->eax = -1;
+    } else {
+      int fd = allocate_fd(opened);
+      if (fd == -1) {
+        lock_acquire(&filesys_lock);
+        file_close(opened);
+        lock_release(&filesys_lock);
+        f->eax = -1;
+      } else {
+        f->eax = fd;
+      }
+    }
     break;
   }
 
   case SYS_FILESIZE: {
     validate_args(f->esp, 1);
-    f->eax = -1;
+    int fd = *(int *)((char *)f->esp + 4);
+    struct file *f_obj = get_file(fd);
+
+    if (f_obj == NULL) {
+      f->eax = -1;
+    } else {
+      lock_acquire(&filesys_lock);
+      f->eax = file_length(f_obj);
+      lock_release(&filesys_lock);
+    }
     break;
   }
 
@@ -165,14 +230,23 @@ static void syscall_handler(struct intr_frame *f) {
       sys_exit(-1);
 
     if (fd == 0) {
-      /* STDIN keyboard read */
+      /* STDIN: keyboard read */
       uint8_t *buf = (uint8_t *)buffer;
       unsigned i;
       for (i = 0; i < size; i++)
         buf[i] = input_getc();
       f->eax = size;
-    } else {
+    } else if (fd == 1) {
       f->eax = -1;
+    } else {
+      struct file *f_obj = get_file(fd);
+      if (f_obj == NULL) {
+        f->eax = -1;
+      } else {
+        lock_acquire(&filesys_lock);
+        f->eax = file_read(f_obj, buffer, size);
+        lock_release(&filesys_lock);
+      }
     }
     break;
   }
@@ -189,25 +263,64 @@ static void syscall_handler(struct intr_frame *f) {
     if (fd == 1) {
       putbuf(buffer, size);
       f->eax = size;
-    } else {
+    } else if (fd == 0) {
       f->eax = -1;
+    } else {
+      struct file *f_obj = get_file(fd);
+      if (f_obj == NULL) {
+        f->eax = -1;
+      } else {
+        lock_acquire(&filesys_lock);
+        f->eax = file_write(f_obj, buffer, size);
+        lock_release(&filesys_lock);
+      }
     }
     break;
   }
 
   case SYS_SEEK: {
     validate_args(f->esp, 2);
+    int fd = *(int *)((char *)f->esp + 4);
+    unsigned position = *(unsigned *)((char *)f->esp + 8);
+    struct file *f_obj = get_file(fd);
+
+    if (f_obj != NULL) {
+      lock_acquire(&filesys_lock);
+      file_seek(f_obj, position);
+      lock_release(&filesys_lock);
+    }
     break;
   }
 
   case SYS_TELL: {
     validate_args(f->esp, 1);
-    f->eax = 0;
+    int fd = *(int *)((char *)f->esp + 4);
+    struct file *f_obj = get_file(fd);
+
+    if (f_obj == NULL) {
+      f->eax = -1;
+    } else {
+      lock_acquire(&filesys_lock);
+      f->eax = file_tell(f_obj);
+      lock_release(&filesys_lock);
+    }
     break;
   }
 
   case SYS_CLOSE: {
     validate_args(f->esp, 1);
+    int fd = *(int *)((char *)f->esp + 4);
+
+    if (fd >= 2 && fd < MAX_FD) {
+      struct thread *cur = thread_current();
+      struct file *f_obj = cur->fd_table[fd];
+      if (f_obj != NULL) {
+        cur->fd_table[fd] = NULL;
+        lock_acquire(&filesys_lock);
+        file_close(f_obj);
+        lock_release(&filesys_lock);
+      }
+    }
     break;
   }
 

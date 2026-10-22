@@ -351,12 +351,47 @@ Before running the full suite, `$SIMULATOR` is set to `qemu` in `pintos/src/test
 - `tests/userprog/open-bad-ptr` -> **PASS** (bad filename pointer rejected)
 - `tests/userprog/exec-bad-ptr` -> **PASS** (bad command-line pointer rejected)
 
+#### Milestone 4 & 5: Basic & File-System System Calls (100% Pass)
+- `tests/userprog/create-normal` -> **PASS**
+- `tests/userprog/create-empty` -> **PASS**
+- `tests/userprog/create-null` -> **PASS**
+- `tests/userprog/create-bad-ptr` -> **PASS**
+- `tests/userprog/create-long` -> **PASS**
+- `tests/userprog/create-exists` -> **PASS**
+- `tests/userprog/create-bound` -> **PASS**
+- `tests/userprog/open-normal` -> **PASS**
+- `tests/userprog/open-missing` -> **PASS**
+- `tests/userprog/open-boundary` -> **PASS**
+- `tests/userprog/open-empty` -> **PASS**
+- `tests/userprog/open-null` -> **PASS**
+- `tests/userprog/open-bad-ptr` -> **PASS**
+- `tests/userprog/open-twice` -> **PASS**
+- `tests/userprog/close-normal` -> **PASS**
+- `tests/userprog/close-twice` -> **PASS**
+- `tests/userprog/close-stdin` -> **PASS**
+- `tests/userprog/close-stdout` -> **PASS**
+- `tests/userprog/close-bad-fd` -> **PASS**
+- `tests/userprog/read-normal` -> **PASS**
+- `tests/userprog/read-bad-ptr` -> **PASS**
+- `tests/userprog/read-boundary` -> **PASS**
+- `tests/userprog/read-zero` -> **PASS**
+- `tests/userprog/read-stdout` -> **PASS**
+- `tests/userprog/read-bad-fd` -> **PASS**
+- `tests/userprog/write-normal` -> **PASS**
+- `tests/userprog/write-bad-ptr` -> **PASS**
+- `tests/userprog/write-boundary` -> **PASS**
+- `tests/userprog/write-zero` -> **PASS**
+- `tests/userprog/write-stdin` -> **PASS**
+- `tests/userprog/write-bad-fd` -> **PASS**
+- `tests/userprog/rox-simple` -> **PASS** (read-only executable protection verified)
+- `tests/filesys/base/*` -> **PASS** (`lg-create`, `lg-full`, `lg-random`, `lg-seq-block`, `lg-seq-random`, `sm-create`, `sm-full`, `sm-random`, `sm-seq-block`, `sm-seq-random`, `syn-remove`)
+
 #### Current Test Suite Execution (`make check`)
 - **Total Tests:** 80
-- **Passed:** 38 (up from 11)
-- **Failing / Pending Implementation:** 42 (Awaiting Milestone 4/5 file-descriptor table & basic file syscalls, Milestone 6 exec/wait synchronization, and Milestone 7 global filesystem lock).
+- **Passed:** 66 (up from 38)
+- **Failing / Pending Implementation:** 14 (Only Milestone 6 remains: parent-child `exec`/`wait` status tracking and process synchronization).
 
-Passing tests log (38 tests):
+Passing tests log (66 tests):
 ```text
 pass tests/userprog/args-none
 pass tests/userprog/args-single
@@ -370,19 +405,35 @@ pass tests/userprog/sc-boundary-2
 pass tests/userprog/sc-boundary-3
 pass tests/userprog/halt
 pass tests/userprog/exit
+pass tests/userprog/create-normal
 pass tests/userprog/create-empty
 pass tests/userprog/create-null
 pass tests/userprog/create-bad-ptr
 pass tests/userprog/create-long
+pass tests/userprog/create-exists
+pass tests/userprog/create-bound
+pass tests/userprog/open-normal
 pass tests/userprog/open-missing
+pass tests/userprog/open-boundary
 pass tests/userprog/open-empty
 pass tests/userprog/open-null
 pass tests/userprog/open-bad-ptr
+pass tests/userprog/open-twice
+pass tests/userprog/close-normal
+pass tests/userprog/close-twice
 pass tests/userprog/close-stdin
 pass tests/userprog/close-stdout
 pass tests/userprog/close-bad-fd
+pass tests/userprog/read-normal
+pass tests/userprog/read-bad-ptr
+pass tests/userprog/read-boundary
+pass tests/userprog/read-zero
 pass tests/userprog/read-stdout
 pass tests/userprog/read-bad-fd
+pass tests/userprog/write-normal
+pass tests/userprog/write-bad-ptr
+pass tests/userprog/write-boundary
+pass tests/userprog/write-zero
 pass tests/userprog/write-stdin
 pass tests/userprog/write-bad-fd
 pass tests/userprog/exec-bound-2
@@ -390,12 +441,24 @@ pass tests/userprog/exec-bound-3
 pass tests/userprog/exec-missing
 pass tests/userprog/exec-bad-ptr
 pass tests/userprog/wait-bad-pid
+pass tests/userprog/rox-simple
 pass tests/userprog/bad-read
 pass tests/userprog/bad-write
 pass tests/userprog/bad-read2
 pass tests/userprog/bad-write2
 pass tests/userprog/bad-jump
 pass tests/userprog/bad-jump2
+pass tests/filesys/base/lg-create
+pass tests/filesys/base/lg-full
+pass tests/filesys/base/lg-random
+pass tests/filesys/base/lg-seq-block
+pass tests/filesys/base/lg-seq-random
+pass tests/filesys/base/sm-create
+pass tests/filesys/base/sm-full
+pass tests/filesys/base/sm-random
+pass tests/filesys/base/sm-seq-block
+pass tests/filesys/base/sm-seq-random
+pass tests/filesys/base/syn-remove
 ```
 
 ---

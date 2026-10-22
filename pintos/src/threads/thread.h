@@ -8,6 +8,8 @@
 #include "threads/fixed-point.h"
 #include "threads/synch.h"
 
+struct file;
+
 /* States in a thread's life cycle. */
 enum thread_status {
   THREAD_RUNNING, /* Running thread. */
@@ -103,6 +105,8 @@ struct thread {
   struct semaphore wait_sema; /* Synchronizes parent wait with child exit. */
   bool exited;                /* Has the process exited? */
   int exit_status;            /* Process termination exit status. */
+  struct file *fd_table[128]; /* Per-process file descriptor table. */
+  struct file *exec_file;     /* Running executable file (write denied). */
 #endif
 
   int nice;        /* Niceness (-20 to 20). */

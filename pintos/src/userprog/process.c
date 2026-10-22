@@ -10,6 +10,7 @@
 #include "threads/vaddr.h"
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
+#include "userprog/syscall.h"
 #include "userprog/tss.h"
 #include <debug.h>
 #include <inttypes.h>
@@ -110,6 +111,26 @@ void process_exit(void) {
      Only user processes have a user page directory. */
   if (cur->pagedir != NULL) {
     printf("%s: exit(%d)\n", cur->name, cur->exit_status);
+  }
+
+  /* Close all open file descriptors for this process. */
+  int fd;
+  for (fd = 2; fd < 128; fd++) {
+    if (cur->fd_table[fd] != NULL) {
+      lock_acquire(&filesys_lock);
+      file_close(cur->fd_table[fd]);
+      lock_release(&filesys_lock);
+      cur->fd_table[fd] = NULL;
+    }
+  }
+
+  /* Allow write and close the running executable file. */
+  if (cur->exec_file != NULL) {
+    lock_acquire(&filesys_lock);
+    file_allow_write(cur->exec_file);
+    file_close(cur->exec_file);
+    lock_release(&filesys_lock);
+    cur->exec_file = NULL;
   }
 
   /* Signal waiting parent. */
@@ -248,8 +269,10 @@ bool load(const char *file_name, void (**eip)(void), void **esp) {
   process_activate();
 
   /* Open executable file using the program name (argv[0]). */
+  lock_acquire(&filesys_lock);
   file = filesys_open(argv[0]);
   if (file == NULL) {
+    lock_release(&filesys_lock);
     printf("load: %s: open failed\n", argv[0]);
     goto done;
   }
@@ -322,11 +345,20 @@ bool load(const char *file_name, void (**eip)(void), void **esp) {
   /* Start address. */
   *eip = (void (*)(void))ehdr.e_entry;
 
+  /* Deny write to running executable while process is active. */
+  file_deny_write(file);
+  t->exec_file = file;
+
   success = true;
 
 done:
   /* We arrive here whether the load is successful or not. */
-  file_close(file);
+  if (!success && file != NULL) {
+    file_close(file);
+    t->exec_file = NULL;
+  }
+  if (lock_held_by_current_thread(&filesys_lock))
+    lock_release(&filesys_lock);
   return success;
 }
 

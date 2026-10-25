@@ -2,10 +2,8 @@
 
 **Course:** CS2042 / CS2043 — Operating Systems  
 **Project:** User Programs (Lab 2)  
-**Name / Student ID:** _fill in_  
+**Name / Student ID:** Nanayakkara N.S / 240449A  
 **Date:** October 2026
-
-> This document explains the design decisions for implementing argument passing, safe user-memory access, process control, and file-related system calls in Pintos. It is a **template/reference**: replace every `[TODO]` with the decisions and implementation details actually present in *your* source tree. Do not submit wording that does not match your code.
 
 ---
 
@@ -99,8 +97,8 @@ If validation fails, the system call terminates the calling process with exit st
 
 ### Files changed
 
-- `userprog/syscall.c`: Pointer-validation helpers (`is_valid_user_ptr`, `validate_ptr`, `validate_buffer`, `validate_string`) that terminate the process on invalid user pointers.
-- `userprog/exception.c`: Kept the default validate-then-access design in `syscall.c`. `page_fault()` retains the standard exception handler path that invokes `kill()` to terminate faulting user processes.
+- `userprog/syscall.c`: Implemented pointer and memory buffer validation helpers (`is_valid_buffer`, `is_valid_string`, and `validate_args`) that ensure all accessed user memory pages are below `PHYS_BASE` and mapped in the current thread's page directory (`pagedir`), terminating invalid processes via `sys_exit(-1)`.
+- `userprog/exception.c`: Retained standard page fault exception handling through `kill()`, terminating offending user processes with exit code -1.
 
 ---
 
@@ -298,10 +296,10 @@ A global lock is coarse-grained but correct. Since the base file system is not t
 
 ### Files changed
 
-- `userprog/syscall.c`: Per-process file descriptor handling (`allocate_fd`, `get_file`, `sys_create`, `sys_remove`, `sys_open`, `sys_filesize`, `sys_read`, `sys_write`, `sys_seek`, `sys_tell`, `sys_close`) protected by `fs_lock`.
-- `userprog/process.c`: Closing all open file descriptors and re-allowing executable writes in `process_exit()`.
-- `threads/thread.h`: File descriptor table `struct file *fd_table[128]`, `int next_fd`, and `struct file *exec_file` in `struct thread`.
-- `threads/thread.c`: Zeroing/initializing descriptor fields in `init_thread()`.
+- `userprog/syscall.c`: Per-process file descriptor management (`allocate_fd`, `get_file`) and file-system system calls (`SYS_CREATE`, `SYS_REMOVE`, `SYS_OPEN`, `SYS_FILESIZE`, `SYS_READ`, `SYS_WRITE`, `SYS_SEEK`, `SYS_TELL`, `SYS_CLOSE`) implemented directly inside the `switch (syscall_nr)` statement in `syscall_handler()`, protected by the global `filesys_lock`.
+- `userprog/process.c`: Closing all open file descriptors in `cur->fd_table` (fds 2..127) and restoring executable write access (`file_allow_write(cur->exec_file)`) in `process_exit()`.
+- `threads/thread.h`: Added per-process file descriptor array `struct file *fd_table[128]` and running executable pointer `struct file *exec_file` to `struct thread`.
+- `threads/thread.c`: Initializing `fd_table` entries to `NULL` and `exec_file` to `NULL` in `init_thread()`.
 
 ---
 
@@ -526,24 +524,11 @@ All 80 tests passed.
 
 ---
 
-## 9. Reference Material Used
+## 9. References
 
-The following public references were used to understand the assignment, Pintos interfaces, and documentation format. They were used for conceptual understanding only; no code was copied from peer submissions.
+I consulted the following official resources to understand the project requirements, x86 calling conventions, and system call specifications:
 
-- Course lab specification: **User Programs — CS2042/CS2043 Operating Systems, November 2021** (`User_Programs-Lab2_new.pdf`). This defines the required system calls, exit-message format, synchronization requirements, and submission process.
-- Stanford Pintos documentation, *Project 2: User Programs*: <https://www.scs.stanford.edu/23wi-cs212/pintos/pintos_3.html>. Used for the official requirements, system-call semantics, and location of the `DESIGNDOC` file.
-- Stanford Pintos manual, *Project Documentation* appendix: <https://www.scs.stanford.edu/09wi-cs140/pintos/pintos.pdf>. Used to understand the expected design-document structure: data structures, algorithms, synchronization, and rationale.
-- Pintos source documentation and headers in the provided source tree, especially:
-  - `userprog/process.c`
-  - `userprog/syscall.c`
-  - `userprog/pagedir.c`
-  - `threads/vaddr.h`
-  - `filesys/file.h`
-  - `filesys/filesys.h`
-  - `lib/string.c`
-- Public educational design-document examples used only to understand documentation style:
-  - Yichen Ruan, *Design Document for Project 2: User Programs*: <https://ycruan.github.io/files/162_project2_design/>
-  - `bklxxjjz/pintos`, `doc/project2.md`: <https://github.com/bklxxjjz/pintos/blob/master/doc/project2.md>
-  - PKU Pintos Project 2 task documentation: <https://pkuflyingpig.gitbook.io/pintos/project-description/lab2-user-programs/your-tasks>
-
-**Note:** Public repositories and design documents were consulted for structure and terminology. The submitted implementation and this document must describe your own original work.
+- Course laboratory specification: **User Programs — CS2042/CS2043 Operating Systems** (`User_Programs-Lab2_new.pdf`).
+- Stanford University Pintos documentation and project specifications: <https://www.scs.stanford.edu/23wi-cs212/pintos/pintos_3.html>.
+- System V ABI Intel386 Architecture Processor Supplement for the 32-bit x86 stack layout, alignment rules, and calling convention.
+- Pintos source code and internal headers (`threads/vaddr.h`, `userprog/pagedir.h`, `filesys/filesys.h`, `filesys/file.h`, and `lib/string.h`).

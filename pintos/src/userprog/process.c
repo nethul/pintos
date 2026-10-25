@@ -5,6 +5,7 @@
 #include "threads/flags.h"
 #include "threads/init.h"
 #include "threads/interrupt.h"
+#include "threads/malloc.h"
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
@@ -19,27 +20,63 @@
 #include <stdlib.h>
 #include <string.h>
 
-
 #define MAX_ARGS 64
+
+/* Data passed from process_execute() to start_process() in a single page. */
+struct process_starter {
+  struct child_status *cs;
+  char cmdline[PGSIZE - sizeof(struct child_status *)];
+};
 
 static thread_func start_process NO_RETURN;
 static bool load(const char *cmdline, void (**eip)(void), void **esp);
 static bool setup_stack(void **esp, int argc, char *argv[]);
+
+/* Safely decrements the reference count of a child_status record.
+   If the reference count reaches 0, frees the memory. */
+static void child_status_unref(struct child_status *cs) {
+  if (cs == NULL)
+    return;
+  enum intr_level old_level = intr_disable();
+  cs->ref_count--;
+  bool free_now = (cs->ref_count == 0);
+  intr_set_level(old_level);
+  if (free_now)
+    free(cs);
+}
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
 tid_t process_execute(const char *file_name) {
-  char *fn_copy;
+  struct process_starter *starter;
+  struct child_status *cs;
   tid_t tid;
 
-  /* Make a copy of FILE_NAME.
-     Otherwise there's a race between the caller and load(). */
-  fn_copy = palloc_get_page(0);
-  if (fn_copy == NULL)
+  /* Allocate a starter block containing the child_status pointer
+     and command line copy to pass safely to start_process. */
+  starter = palloc_get_page(0);
+  if (starter == NULL)
     return TID_ERROR;
-  strlcpy(fn_copy, file_name, PGSIZE);
+
+  cs = malloc(sizeof(struct child_status));
+  if (cs == NULL) {
+    palloc_free_page(starter);
+    return TID_ERROR;
+  }
+
+  cs->tid = TID_ERROR;
+  cs->exit_status = -1;
+  cs->exited = false;
+  cs->waited = false;
+  cs->load_success = false;
+  sema_init(&cs->load_sema, 0);
+  sema_init(&cs->wait_sema, 0);
+  cs->ref_count = 2; /* 1 reference for parent, 1 reference for child */
+
+  starter->cs = cs;
+  strlcpy(starter->cmdline, file_name, sizeof starter->cmdline);
 
   /* Extract program name (first word) to name the thread. */
   char thread_name[16];
@@ -47,29 +84,59 @@ tid_t process_execute(const char *file_name) {
   strlcpy(thread_name, file_name, sizeof thread_name);
   strtok_r(thread_name, " ", &save_ptr);
 
-  /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create(thread_name, PRI_DEFAULT, start_process, fn_copy);
-  if (tid == TID_ERROR)
-    palloc_free_page(fn_copy);
+  /* Track the child in the current thread's children list. */
+  struct thread *cur = thread_current();
+  list_push_back(&cur->children, &cs->elem);
+
+  /* Create a new thread to execute the program. */
+  tid = thread_create(thread_name, PRI_DEFAULT, start_process, starter);
+  if (tid == TID_ERROR) {
+    list_remove(&cs->elem);
+    free(cs);
+    palloc_free_page(starter);
+    return TID_ERROR;
+  }
+
+  cs->tid = tid;
+
+  /* Block until child finishes loading the executable in start_process. */
+  sema_down(&cs->load_sema);
+
+  /* If loading failed, remove child status and return TID_ERROR (-1). */
+  if (!cs->load_success) {
+    list_remove(&cs->elem);
+    child_status_unref(cs);
+    return TID_ERROR;
+  }
+
   return tid;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
-static void start_process(void *file_name_) {
-  char *file_name = file_name_;
+static void start_process(void *starter_) {
+  struct process_starter *starter = starter_;
+  struct thread *cur = thread_current();
   struct intr_frame if_;
   bool success;
+
+  /* Link shared child_status and record our tid. */
+  cur->child_status = starter->cs;
+  cur->child_status->tid = cur->tid;
 
   /* Initialize interrupt frame and load executable. */
   memset(&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load(file_name, &if_.eip, &if_.esp);
+  success = load(starter->cmdline, &if_.eip, &if_.esp);
+
+  /* Record load outcome and signal parent in process_execute(). */
+  cur->child_status->load_success = success;
+  palloc_free_page(starter);
+  sema_up(&cur->child_status->load_sema);
 
   /* If load failed, quit. */
-  palloc_free_page(file_name);
   if (!success)
     thread_exit();
 
@@ -88,18 +155,38 @@ static void start_process(void *file_name_) {
    exception), returns -1.  If TID is invalid or if it was not a
    child of the calling process, or if process_wait() has already
    been successfully called for the given TID, returns -1
-   immediately, without waiting.
-
-   This function will be implemented in problem 2-2.  For now, it
-   does nothing. */
+   immediately, without waiting. */
 int process_wait(tid_t child_tid) {
-  struct thread *child = thread_get_by_tid(child_tid);
-  if (child == NULL)
+  struct thread *cur = thread_current();
+  struct list_elem *e;
+  struct child_status *cs = NULL;
+
+  /* Search for child_tid in caller's direct children list. */
+  for (e = list_begin(&cur->children); e != list_end(&cur->children);
+       e = list_next(e)) {
+    struct child_status *c = list_entry(e, struct child_status, elem);
+    if (c->tid == child_tid) {
+      cs = c;
+      break;
+    }
+  }
+
+  /* If TID was not a direct child or wait was already called, return -1. */
+  if (cs == NULL || cs->waited)
     return -1;
 
+  cs->waited = true;
+
   /* Block until child exits. */
-  sema_down(&child->wait_sema);
-  return 0;
+  sema_down(&cs->wait_sema);
+
+  int status = cs->exit_status;
+
+  /* Remove from parent's children list and drop parent's reference. */
+  list_remove(&cs->elem);
+  child_status_unref(cs);
+
+  return status;
 }
 
 /* Free the current process's resources. */
@@ -133,9 +220,25 @@ void process_exit(void) {
     cur->exec_file = NULL;
   }
 
-  /* Signal waiting parent. */
-  cur->exited = true;
-  sema_up(&cur->wait_sema);
+  /* Release filesys_lock if held by current thread (e.g. killed during I/O). */
+  if (lock_held_by_current_thread(&filesys_lock))
+    lock_release(&filesys_lock);
+
+  /* Clean up children list: drop parent's reference to any children. */
+  while (!list_empty(&cur->children)) {
+    struct list_elem *e = list_pop_front(&cur->children);
+    struct child_status *c = list_entry(e, struct child_status, elem);
+    child_status_unref(c);
+  }
+
+  /* Signal waiting parent if we have a child_status record. */
+  if (cur->child_status != NULL) {
+    cur->child_status->exit_status = cur->exit_status;
+    cur->child_status->exited = true;
+    sema_up(&cur->child_status->wait_sema);
+    child_status_unref(cur->child_status);
+    cur->child_status = NULL;
+  }
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */

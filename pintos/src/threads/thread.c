@@ -625,13 +625,13 @@ static void init_thread(struct thread *t, const char *name, int priority) {
   list_init(&t->locks_held);
 
 #ifdef USERPROG
-  sema_init(&t->wait_sema, 0);
-  t->exited = false;
   t->exit_status = -1;
   int i;
   for (i = 0; i < 128; i++)
     t->fd_table[i] = NULL;
   t->exec_file = NULL;
+  list_init(&t->children);
+  t->child_status = NULL;
 #endif
 
   if (thread_mlfqs) {

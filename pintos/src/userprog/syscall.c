@@ -8,6 +8,7 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
+#include "userprog/process.h"
 #include <stdio.h>
 #include <syscall-nr.h>
 
@@ -139,15 +140,14 @@ static void syscall_handler(struct intr_frame *f) {
     const char *cmd_line = *(const char **)((char *)f->esp + 4);
     if (!is_valid_string(cmd_line))
       sys_exit(-1);
-    /* Exec will be fully implemented in Milestone 6 */
-    f->eax = -1;
+    f->eax = process_execute(cmd_line);
     break;
   }
 
   case SYS_WAIT: {
     validate_args(f->esp, 1);
-    /* Wait will be fully implemented in Milestone 6 */
-    f->eax = -1;
+    int pid = *(int *)((char *)f->esp + 4);
+    f->eax = process_wait(pid);
     break;
   }
 

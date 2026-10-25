@@ -23,6 +23,19 @@ enum thread_status {
 typedef int tid_t;
 #define TID_ERROR ((tid_t) - 1) /* Error value for tid_t. */
 
+/* Child process status tracking for parent-child relationship. */
+struct child_status {
+  tid_t tid;                  /* Child thread ID. */
+  int exit_status;            /* Exit status of the child. */
+  bool exited;                /* Has the child exited? */
+  bool waited;                /* Has the parent already waited for it? */
+  bool load_success;          /* Did the child load successfully? */
+  struct semaphore load_sema; /* Synchronizes parent exec with child load. */
+  struct semaphore wait_sema; /* Synchronizes parent wait with child exit. */
+  struct list_elem elem;      /* Element in parent's children list. */
+  int ref_count;              /* Reference count (parent and child). */
+};
+
 /* Thread priorities. */
 #define PRI_MIN 0      /* Lowest priority. */
 #define PRI_DEFAULT 31 /* Default priority. */
@@ -101,12 +114,12 @@ struct thread {
 
 #ifdef USERPROG
   /* Owned by userprog/process.c. */
-  uint32_t *pagedir;          /* Page directory. */
-  struct semaphore wait_sema; /* Synchronizes parent wait with child exit. */
-  bool exited;                /* Has the process exited? */
-  int exit_status;            /* Process termination exit status. */
-  struct file *fd_table[128]; /* Per-process file descriptor table. */
-  struct file *exec_file;     /* Running executable file (write denied). */
+  uint32_t *pagedir;                 /* Page directory. */
+  int exit_status;                   /* Process termination exit status. */
+  struct file *fd_table[128];        /* Per-process file descriptor table. */
+  struct file *exec_file;            /* Running executable file (write denied). */
+  struct list children;              /* List of direct child_status structures. */
+  struct child_status *child_status; /* Shared status record with parent. */
 #endif
 
   int nice;        /* Niceness (-20 to 20). */

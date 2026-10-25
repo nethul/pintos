@@ -3,7 +3,7 @@
 **Course:** CS2042 / CS2043 — Operating Systems  
 **Project:** User Programs (Lab 2)  
 **Name / Student ID:** _fill in_  
-**Date:** _fill in_
+**Date:** October 2026
 
 > This document explains the design decisions for implementing argument passing, safe user-memory access, process control, and file-related system calls in Pintos. It is a **template/reference**: replace every `[TODO]` with the decisions and implementation details actually present in *your* source tree. Do not submit wording that does not match your code.
 
@@ -173,16 +173,31 @@ The grading scripts rely on this exact format. Extra debugging output is removed
 
 Design:
 
-- Validate `cmd_line`.
-- Call `process_execute()`.
-- The parent waits until the child has either successfully loaded its executable or failed to load.
-- If loading fails, return `-1`; otherwise return the child’s pid.
-
-A semaphore (`load_sema` on the thread structure) is used so that the parent cannot return from `exec()` before the child’s load result is known.
+- Validate `cmd_line` pointer and ensure the string lies entirely in valid user virtual memory below `PHYS_BASE`.
+- In `process_execute()`, allocate a `struct process_starter` in a single 4 KiB kernel page (`palloc_get_page(0)`) containing both a pointer to the child status record and a copy of `cmd_line`.
+- Allocate `struct child_status` via `malloc()`. Initialize:
+  - `tid = TID_ERROR`
+  - `exit_status = -1`
+  - `exited = false`, `waited = false`, `load_success = false`
+  - `ref_count = 2` (1 reference owned by parent in `cur->children`, 1 reference owned by child in `cur->child_status`)
+  - `load_sema` initialized to 0
+  - `wait_sema` initialized to 0
+- Add `cs` to the parent’s `children` list before calling `thread_create()`.
+- Spawn the new thread executing `start_process()`. In `start_process()`:
+  - Set `cur->child_status = starter->cs` and `cur->child_status->tid = cur->tid`.
+  - Call `load(starter->cmdline, &if_.eip, &if_.esp)`.
+  - Record `cur->child_status->load_success = success`.
+  - Free the `starter` page (`palloc_free_page(starter)`).
+  - Signal the parent: `sema_up(&cur->child_status->load_sema)`.
+  - If `!success`, call `thread_exit()`.
+- The parent blocks on `sema_down(&cs->load_sema)`.
+- If loading failed (`!cs->load_success`), the parent removes `cs` from `cur->children`, drops its reference via `child_status_unref(cs)`, and returns `TID_ERROR` (`-1`). Otherwise, returns `tid`.
 
 ### Justification
 
-The specification explicitly requires the parent to learn whether the child loaded successfully. Synchronization prevents returning a pid for a process that later fails during startup.
+- Allocating a dedicated `starter` block eliminates race conditions where the command line or child status might be read after the caller modifies or frees memory.
+- The load semaphore guarantees that `exec()` never returns a PID for a process that fails to load its executable.
+- Discarding the failed child status immediately prevents orphaned descriptors or status records from accumulating.
 
 ### 5.3 `wait`
 
@@ -190,42 +205,53 @@ The specification explicitly requires the parent to learn whether the child load
 
 Design:
 
-- Each process maintains a list of its children (`children` list of `struct child_status`).
-- Each child has a shared status record containing:
-  - Child pid or thread id (`tid`).
-  - Exit status (`exit_status`).
-  - Whether the child has exited (`exited`).
-  - Whether the parent has already waited for it (`waited`).
-  - A semaphore (`wait_sema`) used by the parent to sleep until the child exits.
-- `wait()` searches only the caller’s direct-child list.
-- If the pid is not a direct child, or has already been waited for, return `-1` immediately.
-- Otherwise, wait on the child’s semaphore, retrieve the status, mark the child as waited for, and free the child record.
+- Each process maintains a `children` list of `struct child_status`.
+- `process_wait()` searches exclusively within the calling thread's `cur->children` list.
+- If `pid` is not found (i.e. not a direct child, or a grandchild, or a foreign process), or if `cs->waited == true`, return `-1` immediately.
+- Mark `cs->waited = true`.
+- Block on `sema_down(&cs->wait_sema)`. (If the child already terminated, the semaphore value is 1, so `sema_down` returns immediately without sleeping).
+- Read `status = cs->exit_status`.
+- Remove `cs` from `cur->children` and release the parent's reference via `child_status_unref(cs)`.
+- Return `status`.
 
-If the child was killed by the kernel rather than calling `exit()`, `wait()` returns `-1`.
+If the child process was terminated by an unhandled kernel exception rather than `exit()`, `exception.c` sets `cur->exit_status = -1`, ensuring `wait()` returns `-1`.
 
 ### Justification
 
-- A per-child status record preserves exit status even if the child exits before the parent calls `wait()`.
-- A semaphore cleanly blocks the parent without busy-waiting.
-- Restricting lookup to direct children implements the required non-inheritance rule.
-- The waited-for flag ensures each child can be waited on at most once.
-- Resources are freed even if the parent never waits, preventing leaks from orphaned processes.
+- **Reference Counting (`ref_count = 2`):** Guarantees zero memory leaks regardless of termination ordering:
+  - If parent waits on child: child decrements ref_count on exit (to 1); parent decrements ref_count in `process_wait()` (to 0) and frees `cs`.
+  - If parent exits before child: parent frees all children in `cur->children` (dropping references to 1); child decrements ref_count on exit (to 0) and frees `cs`.
+  - If parent never waits on child: child drops reference on exit (to 1); parent drops reference in `process_exit()` (to 0) and frees `cs`.
+- **Direct Child Lookup:** Searching only `cur->children` strictly enforces the rule that processes cannot wait on grandchildren or unrelated processes.
+- **`waited` Flag & Removal:** Prevents a parent from waiting on the same child more than once.
 
 ### 5.4 `exit`
 
-`exit(status)` records the status in the current process’s status record, closes all file descriptors, signals any parent waiting on the process, and terminates the current thread.
+`exit(status)` records the status in `cur->exit_status`, closes all per-process file descriptors, releases the executable lock, signals waiting parents, and terminates the thread.
 
-### Justification
+Cleanup sequence in `process_exit()`:
+1. Print process termination message: `<name>: exit(<status>)`.
+2. Close all open file descriptors (fd 2..127) while acquiring `filesys_lock`.
+3. If `exec_file` is set, call `file_allow_write(cur->exec_file)` and `file_close()`, releasing `filesys_lock`.
+4. Release `filesys_lock` if still held (in case of unexpected termination during I/O).
+5. Clean up all children in `cur->children` list by popping each element and calling `child_status_unref()`.
+6. If `cur->child_status != NULL`, set `exit_status = cur->exit_status`, set `exited = true`, call `sema_up(&cs->wait_sema)`, and drop child reference via `child_status_unref()`.
+7. Destroy the process's page directory (`pagedir_destroy()`) and switch back to base kernel page directory.
 
-Centralizing cleanup in the exit path ensures that both normal exits and kernel-initiated termination release resources consistently.
+### 5.5 Modern Toolchain Page-Size Alignment Fix
+
+When compiling 32-bit user binaries (`-m32`) using modern x86_64 toolchains (binutils `ld`), the default linker segment alignment defaults to 2 MiB (`max-page-size=0x200000`). This caused ELF binaries to contain ~72 pages of zero padding between headers and code, inflating test binaries from ~40 KiB to >340 KiB and exhausting Pintos's 4 MiB physical RAM pool during deep recursion (`multi-recurse`).
+
+By adding `-Wl,-z,max-page-size=4096 -Wl,--build-id=none` to `LDFLAGS` in `src/Makefile.userprog`, user binaries are generated with standard 4 KiB page alignment, reducing process memory footprints to 5 pages and allowing full recursive process execution without memory exhaustion.
 
 ### Files changed
 
-- `userprog/process.c`: Child process creation, pointer passing at page boundary, argument tokenization & stack setup in `setup_stack()`, executable write denial, `process_wait()`, and `process_exit()`.
+- `userprog/process.c`: Implementation of `process_starter`, `child_status_unref()`, `process_execute()`, `start_process()`, `process_wait()`, `process_exit()`, and stack initialization.
 - `userprog/process.h`: Declarations of `process_execute()`, `process_wait()`, `process_exit()`, and `process_activate()`.
 - `userprog/syscall.c`: Handlers for `SYS_EXEC`, `SYS_WAIT`, and `SYS_EXIT`.
-- `threads/thread.h`: Extended `struct thread` with `exit_status`, `children` list, `own_status`, `load_sema`, `load_success`, `fd_table[128]`, `next_fd`, and `exec_file`. Defined `struct child_status`.
-- `threads/thread.c`: Initialized userprog fields in `init_thread()`.
+- `threads/thread.h`: Added `struct child_status`, extended `struct thread` with `children` list, `child_status`, `exit_status`, `fd_table[128]`, and `exec_file`.
+- `threads/thread.c`: Initialization of `children` list and userprog state in `init_thread()`.
+- `Makefile.userprog`: Added `-Wl,-z,max-page-size=4096 -Wl,--build-id=none` to `LDFLAGS`.
 
 ---
 
@@ -386,12 +412,34 @@ Before running the full suite, `$SIMULATOR` is set to `qemu` in `pintos/src/test
 - `tests/userprog/rox-simple` -> **PASS** (read-only executable protection verified)
 - `tests/filesys/base/*` -> **PASS** (`lg-create`, `lg-full`, `lg-random`, `lg-seq-block`, `lg-seq-random`, `sm-create`, `sm-full`, `sm-random`, `sm-seq-block`, `sm-seq-random`, `syn-remove`)
 
-#### Current Test Suite Execution (`make check`)
-- **Total Tests:** 80
-- **Passed:** 66 (up from 38)
-- **Failing / Pending Implementation:** 14 (Only Milestone 6 remains: parent-child `exec`/`wait` status tracking and process synchronization).
+#### Milestone 6: Process Control, Parent-Child Synchronization & Stress (100% Pass)
+- `tests/userprog/exec-once` -> **PASS** (child executes and completes)
+- `tests/userprog/exec-arg` -> **PASS** (arguments parsed and verified in child)
+- `tests/userprog/exec-bound` -> **PASS** (exec string near page boundary)
+- `tests/userprog/exec-bound-2` -> **PASS** (exec string crossing page boundary)
+- `tests/userprog/exec-bound-3` -> **PASS** (exec string spanning boundary)
+- `tests/userprog/exec-multiple` -> **PASS** (multiple children spawned and waited)
+- `tests/userprog/exec-missing` -> **PASS** (nonexistent executable returns -1)
+- `tests/userprog/exec-bad-ptr` -> **PASS** (invalid executable pointer rejected)
+- `tests/userprog/wait-simple` -> **PASS** (parent waits for child exit status)
+- `tests/userprog/wait-twice` -> **PASS** (re-waiting on same child returns -1)
+- `tests/userprog/wait-killed` -> **PASS** (kernel-terminated child returns -1)
+- `tests/userprog/wait-bad-pid` -> **PASS** (waiting on invalid/non-child PID returns -1)
+- `tests/userprog/multi-recurse` -> **PASS** (15 levels of recursive exec and wait)
+- `tests/userprog/multi-child-fd` -> **PASS** (non-inheritance of file descriptors verified)
+- `tests/userprog/rox-child` -> **PASS** (executable write denial across parent and child)
+- `tests/userprog/rox-multichild` -> **PASS** (executable write denial with multiple children)
+- `tests/userprog/no-vm/multi-oom` -> **PASS** (10 successive waves of process exhaustion and memory reclamation with zero memory leaks)
+- `tests/filesys/base/syn-read` -> **PASS** (10 concurrent child readers synchronized)
+- `tests/filesys/base/syn-write` -> **PASS** (concurrent child writers serialized)
 
-Passing tests log (66 tests):
+#### Final Test Suite Execution (`make check`)
+- **Total Tests:** 80
+- **Passed:** 80
+- **Failed:** 0
+- **Pass Rate:** **100%**
+
+Passing tests log:
 ```text
 pass tests/userprog/args-none
 pass tests/userprog/args-single
@@ -436,18 +484,30 @@ pass tests/userprog/write-boundary
 pass tests/userprog/write-zero
 pass tests/userprog/write-stdin
 pass tests/userprog/write-bad-fd
+pass tests/userprog/exec-once
+pass tests/userprog/exec-arg
+pass tests/userprog/exec-bound
 pass tests/userprog/exec-bound-2
 pass tests/userprog/exec-bound-3
+pass tests/userprog/exec-multiple
 pass tests/userprog/exec-missing
 pass tests/userprog/exec-bad-ptr
+pass tests/userprog/wait-simple
+pass tests/userprog/wait-twice
+pass tests/userprog/wait-killed
 pass tests/userprog/wait-bad-pid
+pass tests/userprog/multi-recurse
+pass tests/userprog/multi-child-fd
 pass tests/userprog/rox-simple
+pass tests/userprog/rox-child
+pass tests/userprog/rox-multichild
 pass tests/userprog/bad-read
 pass tests/userprog/bad-write
 pass tests/userprog/bad-read2
 pass tests/userprog/bad-write2
 pass tests/userprog/bad-jump
 pass tests/userprog/bad-jump2
+pass tests/userprog/no-vm/multi-oom
 pass tests/filesys/base/lg-create
 pass tests/filesys/base/lg-full
 pass tests/filesys/base/lg-random
@@ -458,7 +518,10 @@ pass tests/filesys/base/sm-full
 pass tests/filesys/base/sm-random
 pass tests/filesys/base/sm-seq-block
 pass tests/filesys/base/sm-seq-random
+pass tests/filesys/base/syn-read
 pass tests/filesys/base/syn-remove
+pass tests/filesys/base/syn-write
+All 80 tests passed.
 ```
 
 ---

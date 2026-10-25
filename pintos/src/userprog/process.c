@@ -7,6 +7,7 @@
 #include "threads/interrupt.h"
 #include "threads/malloc.h"
 #include "threads/palloc.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/gdt.h"
@@ -32,15 +33,15 @@ static thread_func start_process NO_RETURN;
 static bool load(const char *cmdline, void (**eip)(void), void **esp);
 static bool setup_stack(void **esp, int argc, char *argv[]);
 
-/* Safely decrements the reference count of a child_status record.
-   If the reference count reaches 0, frees the memory. */
+/* Drops a reference to the child_status record and deallocates it
+   once both parent and child are finished with it. */
 static void child_status_unref(struct child_status *cs) {
   if (cs == NULL)
     return;
-  enum intr_level old_level = intr_disable();
+  lock_acquire(&cs->ref_lock);
   cs->ref_count--;
   bool free_now = (cs->ref_count == 0);
-  intr_set_level(old_level);
+  lock_release(&cs->ref_lock);
   if (free_now)
     free(cs);
 }
@@ -73,6 +74,7 @@ tid_t process_execute(const char *file_name) {
   cs->load_success = false;
   sema_init(&cs->load_sema, 0);
   sema_init(&cs->wait_sema, 0);
+  lock_init(&cs->ref_lock);
   cs->ref_count = 2; /* 1 reference for parent, 1 reference for child */
 
   starter->cs = cs;
@@ -567,22 +569,8 @@ static bool load_segment(struct file *file, off_t ofs, uint8_t *upage,
   return true;
 }
 
-/* Create the user process initial stack and push command-line arguments
-   following the 32-bit x86 calling convention expected by C main().
-
-   Stack Layout (High Memory to Low Memory):
-     PHYS_BASE  -> [ argv[argc-1] string ... ]
-                   [ ... ]
-                   [ argv[0] string ... ]
-                   [ word-align padding (0..3 bytes) ]
-                   [ argv[argc] = NULL ]
-                   [ argv[argc-1] pointer ]
-                   [ ... ]
-                   [ argv[0] pointer ]
-                   [ argv (pointer to argv[0]) ]
-                   [ argc ]
-     *esp       -> [ fake return address = 0 ]
-*/
+/* Sets up the user stack by allocating a zeroed page at the top of user
+   address space and pushing argc/argv according to 32-bit x86 C ABI conventions. */
 static bool setup_stack(void **esp, int argc, char *argv[]) {
   uint8_t *kpage;
   bool success = false;
@@ -599,45 +587,43 @@ static bool setup_stack(void **esp, int argc, char *argv[]) {
 
   uint8_t *sp = (uint8_t *)PHYS_BASE;
 
-  /* Step 1: Push argument strings in right-to-left order.
-     Record the virtual address of each string on the user stack. */
+  /* Push each argument string onto stack and remember where each landed */
   char *arg_addrs[MAX_ARGS];
   int i;
   for (i = argc - 1; i >= 0; i--) {
-    size_t len = strlen(argv[i]) + 1; /* include null terminator */
+    size_t len = strlen(argv[i]) + 1;
     sp -= len;
     memcpy(sp, argv[i], len);
     arg_addrs[i] = (char *)sp;
   }
 
-  /* Step 2: Word-align the stack pointer to a 4-byte boundary. */
+  /* Word-align the stack pointer (round down to multiple of 4) */
   sp = (uint8_t *)((uintptr_t)sp & ~3);
 
-  /* Step 3: Push null sentinel argv[argc] = NULL. */
+  /* argv[argc] null pointer terminator */
   sp -= sizeof(char *);
   *(char **)sp = NULL;
 
-  /* Step 4: Push pointers to argument strings in right-to-left order
-     so that argv[0] is at the lowest memory address in the array. */
+  /* Push array of argv pointers in reverse order */
   for (i = argc - 1; i >= 0; i--) {
     sp -= sizeof(char *);
     *(char **)sp = arg_addrs[i];
   }
 
-  /* Step 5: Push argv (pointer to argv[0]). */
+  /* Push argv (base address of argv array) */
   char **argv_ptr = (char **)sp;
   sp -= sizeof(char **);
   *(char ***)sp = argv_ptr;
 
-  /* Step 6: Push argc. */
+  /* Push argc */
   sp -= sizeof(int);
   *(int *)sp = argc;
 
-  /* Step 7: Push fake return address (0). */
+  /* Push fake return address (dummy 0 for main) */
   sp -= sizeof(void *);
   *(void **)sp = NULL;
 
-  /* Sanity check: Ensure stack didn't exceed 1 page. */
+  /* Safety check: ensure args fit in a single stack page */
   if (sp < (uint8_t *)PHYS_BASE - PGSIZE) {
     palloc_free_page(kpage);
     return false;

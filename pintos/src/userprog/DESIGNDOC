@@ -216,7 +216,9 @@ If the child process was terminated by an unhandled kernel exception rather than
 
 ### Justification
 
-- **Reference Counting (`ref_count = 2`):** Guarantees zero memory leaks regardless of termination ordering:
+- **Reference Counting with `ref_lock`:** Guarantees thread-safe resource reclamation with zero memory leaks regardless of termination ordering:
+  - Each `child_status` contains a `ref_lock` that serializes access to `ref_count`.
+  - When a parent or child drops its reference, it acquires `ref_lock`, decrements `ref_count`, and frees `cs` only if `ref_count == 0`.
   - If parent waits on child: child decrements ref_count on exit (to 1); parent decrements ref_count in `process_wait()` (to 0) and frees `cs`.
   - If parent exits before child: parent frees all children in `cur->children` (dropping references to 1); child decrements ref_count on exit (to 0) and frees `cs`.
   - If parent never waits on child: child drops reference on exit (to 1); parent drops reference in `process_exit()` (to 0) and frees `cs`.
@@ -244,10 +246,10 @@ By adding `-Wl,-z,max-page-size=4096 -Wl,--build-id=none` to `LDFLAGS` in `src/M
 
 ### Files changed
 
-- `userprog/process.c`: Implementation of `process_starter`, `child_status_unref()`, `process_execute()`, `start_process()`, `process_wait()`, `process_exit()`, and stack initialization.
+- `userprog/process.c`: Implementation of `process_starter`, `child_status_unref()` (using `ref_lock`), `process_execute()`, `start_process()`, `process_wait()`, `process_exit()`, and stack initialization.
 - `userprog/process.h`: Declarations of `process_execute()`, `process_wait()`, `process_exit()`, and `process_activate()`.
-- `userprog/syscall.c`: Handlers for `SYS_EXEC`, `SYS_WAIT`, and `SYS_EXIT`.
-- `threads/thread.h`: Added `struct child_status`, extended `struct thread` with `children` list, `child_status`, `exit_status`, `fd_table[128]`, and `exec_file`.
+- `userprog/syscall.c`: Syscall dispatcher with dedicated helpers `sys_exec`, `sys_wait`, and `sys_exit`.
+- `threads/thread.h`: Added `struct child_status` (with `load_sema`, `wait_sema`, and `ref_lock`), extended `struct thread` with `children` list, `child_status`, `exit_status`, `fd_table[128]`, and `exec_file`.
 - `threads/thread.c`: Initialization of `children` list and userprog state in `init_thread()`.
 - `Makefile.userprog`: Added `-Wl,-z,max-page-size=4096 -Wl,--build-id=none` to `LDFLAGS`.
 
@@ -296,7 +298,7 @@ A global lock is coarse-grained but correct. Since the base file system is not t
 
 ### Files changed
 
-- `userprog/syscall.c`: Per-process file descriptor management (`allocate_fd`, `get_file`) and file-system system calls (`SYS_CREATE`, `SYS_REMOVE`, `SYS_OPEN`, `SYS_FILESIZE`, `SYS_READ`, `SYS_WRITE`, `SYS_SEEK`, `SYS_TELL`, `SYS_CLOSE`) implemented directly inside the `switch (syscall_nr)` statement in `syscall_handler()`, protected by the global `filesys_lock`.
+- `userprog/syscall.c`: Per-process file descriptor management (`allocate_fd`, `get_file`) and modular system call handlers (`sys_create`, `sys_remove`, `sys_open`, `sys_filesize`, `sys_read`, `sys_write`, `sys_seek`, `sys_tell`, `sys_close`) called from `syscall_handler()` via an argument array `uint32_t *args`, protected by the global `filesys_lock`.
 - `userprog/process.c`: Closing all open file descriptors in `cur->fd_table` (fds 2..127) and restoring executable write access (`file_allow_write(cur->exec_file)`) in `process_exit()`.
 - `threads/thread.h`: Added per-process file descriptor array `struct file *fd_table[128]` and running executable pointer `struct file *exec_file` to `struct thread`.
 - `threads/thread.c`: Initializing `fd_table` entries to `NULL` and `exec_file` to `NULL` in `init_thread()`.
@@ -309,10 +311,10 @@ A global lock is coarse-grained but correct. Since the base file system is not t
 
 | Mechanism | Purpose |
 |---|---|
-| Global file-system lock | Serializes all access to the unsynchronized base file system |
-| Load semaphore | Makes parent `exec()` wait for child load success/failure |
-| Per-child wait semaphore | Makes parent `wait()` sleep until child exits |
-| Process/status-record synchronization | Protects exit status and waited-for state, if needed |
+| Global file-system lock (`filesys_lock`) | Serializes all access to the unsynchronized base file system |
+| Load semaphore (`load_sema`) | Makes parent `exec()` wait for child load success/failure |
+| Per-child wait semaphore (`wait_sema`) | Makes parent `wait()` sleep until child exits |
+| Child status reference lock (`ref_lock`) | Protects `ref_count` updates during `child_status_unref()` |
 
 ### Resource cleanup
 

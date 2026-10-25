@@ -87,10 +87,9 @@ static bool is_valid_string(const char *str) {
 }
 
 /* Validates that the user stack contains argc 32-bit arguments starting
-   immediately above the syscall number (i.e. at esp + 4). */
-static void validate_args(const void *esp, size_t argc) {
-  if (!is_valid_buffer((const char *)esp + sizeof(int),
-                       argc * sizeof(uint32_t)))
+   immediately above the syscall number (i.e. at args + 1). */
+static void validate_args(const uint32_t *args, size_t argc) {
+  if (!is_valid_buffer(args + 1, argc * sizeof(uint32_t)))
     sys_exit(-1);
 }
 
@@ -114,215 +113,234 @@ static struct file *get_file(int fd) {
   return thread_current()->fd_table[fd];
 }
 
-static void syscall_handler(struct intr_frame *f) {
-  /* 1. Ensure esp points to valid user memory for the syscall number. */
-  if (!is_valid_buffer(f->esp, sizeof(int))) {
-    sys_exit(-1);
-  }
+/* Terminates Pintos by shutting down the power. */
+static void sys_halt(void) {
+  shutdown_power_off();
+}
 
-  int syscall_nr = *(int *)f->esp;
+/* Starts a child process executing the given command line. */
+static tid_t sys_exec(const char *cmd_line) {
+  if (!is_valid_string(cmd_line))
+    sys_exit(-1);
+  return process_execute(cmd_line);
+}
+
+/* Waits for child process with thread id pid to terminate. */
+static int sys_wait(int pid) {
+  return process_wait(pid);
+}
+
+/* Creates a new file with the specified name and initial size. */
+static bool sys_create(const char *file, off_t initial_size) {
+  if (!is_valid_string(file))
+    sys_exit(-1);
+
+  lock_acquire(&filesys_lock);
+  bool success = filesys_create(file, initial_size);
+  lock_release(&filesys_lock);
+  return success;
+}
+
+/* Deletes the specified file from the filesystem. */
+static bool sys_remove(const char *file) {
+  if (!is_valid_string(file))
+    sys_exit(-1);
+
+  lock_acquire(&filesys_lock);
+  bool success = filesys_remove(file);
+  lock_release(&filesys_lock);
+  return success;
+}
+
+/* Opens the specified file and assigns it a new per-process file descriptor. */
+static int sys_open(const char *file) {
+  if (!is_valid_string(file))
+    sys_exit(-1);
+
+  lock_acquire(&filesys_lock);
+  struct file *opened = filesys_open(file);
+  lock_release(&filesys_lock);
+
+  if (opened == NULL)
+    return -1;
+
+  int fd = allocate_fd(opened);
+  if (fd == -1) {
+    lock_acquire(&filesys_lock);
+    file_close(opened);
+    lock_release(&filesys_lock);
+    return -1;
+  }
+  return fd;
+}
+
+/* Returns the size, in bytes, of the open file referred to by fd. */
+static int sys_filesize(int fd) {
+  struct file *f_obj = get_file(fd);
+  if (f_obj == NULL)
+    return -1;
+
+  lock_acquire(&filesys_lock);
+  int len = file_length(f_obj);
+  lock_release(&filesys_lock);
+  return len;
+}
+
+/* Reads size bytes from fd into buffer. Returns number of bytes actually read. */
+static int sys_read(int fd, void *buffer, unsigned size) {
+  if (!is_valid_buffer(buffer, size))
+    sys_exit(-1);
+
+  if (fd == 0) {
+    uint8_t *buf = (uint8_t *)buffer;
+    unsigned i;
+    for (i = 0; i < size; i++)
+      buf[i] = input_getc();
+    return size;
+  }
+  if (fd == 1)
+    return -1;
+
+  struct file *f_obj = get_file(fd);
+  if (f_obj == NULL)
+    return -1;
+
+  lock_acquire(&filesys_lock);
+  int bytes_read = file_read(f_obj, buffer, size);
+  lock_release(&filesys_lock);
+  return bytes_read;
+}
+
+/* Writes size bytes from buffer to fd. Returns number of bytes written. */
+static int sys_write(int fd, const void *buffer, unsigned size) {
+  if (!is_valid_buffer(buffer, size))
+    sys_exit(-1);
+
+  if (fd == 1) {
+    putbuf(buffer, size);
+    return size;
+  }
+  if (fd == 0)
+    return -1;
+
+  struct file *f_obj = get_file(fd);
+  if (f_obj == NULL)
+    return -1;
+
+  lock_acquire(&filesys_lock);
+  int bytes_written = file_write(f_obj, buffer, size);
+  lock_release(&filesys_lock);
+  return bytes_written;
+}
+
+/* Changes next byte position to be read/written in open file fd. */
+static void sys_seek(int fd, unsigned position) {
+  struct file *f_obj = get_file(fd);
+  if (f_obj != NULL) {
+    lock_acquire(&filesys_lock);
+    file_seek(f_obj, position);
+    lock_release(&filesys_lock);
+  }
+}
+
+/* Returns position of next byte to be read or written in fd. */
+static int sys_tell(int fd) {
+  struct file *f_obj = get_file(fd);
+  if (f_obj == NULL)
+    return -1;
+
+  lock_acquire(&filesys_lock);
+  int pos = file_tell(f_obj);
+  lock_release(&filesys_lock);
+  return pos;
+}
+
+/* Closes file descriptor fd and frees slot in thread's fd table. */
+static void sys_close(int fd) {
+  if (fd >= 2 && fd < MAX_FD) {
+    struct thread *cur = thread_current();
+    struct file *f_obj = cur->fd_table[fd];
+    if (f_obj != NULL) {
+      cur->fd_table[fd] = NULL;
+      lock_acquire(&filesys_lock);
+      file_close(f_obj);
+      lock_release(&filesys_lock);
+    }
+  }
+}
+
+static void syscall_handler(struct intr_frame *f) {
+  /* Ensure stack pointer holds at least the syscall number */
+  if (!is_valid_buffer(f->esp, sizeof(uint32_t)))
+    sys_exit(-1);
+
+  uint32_t *args = (uint32_t *)f->esp;
+  int syscall_nr = args[0];
 
   switch (syscall_nr) {
-  case SYS_HALT: {
-    shutdown_power_off();
+  case SYS_HALT:
+    sys_halt();
     break;
-  }
 
-  case SYS_EXIT: {
-    validate_args(f->esp, 1);
-    int status = *(int *)((char *)f->esp + 4);
-    sys_exit(status);
+  case SYS_EXIT:
+    validate_args(args, 1);
+    sys_exit((int)args[1]);
     break;
-  }
 
-  case SYS_EXEC: {
-    validate_args(f->esp, 1);
-    const char *cmd_line = *(const char **)((char *)f->esp + 4);
-    if (!is_valid_string(cmd_line))
-      sys_exit(-1);
-    f->eax = process_execute(cmd_line);
+  case SYS_EXEC:
+    validate_args(args, 1);
+    f->eax = sys_exec((const char *)args[1]);
     break;
-  }
 
-  case SYS_WAIT: {
-    validate_args(f->esp, 1);
-    int pid = *(int *)((char *)f->esp + 4);
-    f->eax = process_wait(pid);
+  case SYS_WAIT:
+    validate_args(args, 1);
+    f->eax = sys_wait((int)args[1]);
     break;
-  }
 
-  case SYS_CREATE: {
-    validate_args(f->esp, 2);
-    const char *file = *(const char **)((char *)f->esp + 4);
-    off_t initial_size = *(off_t *)((char *)f->esp + 8);
-
-    if (!is_valid_string(file))
-      sys_exit(-1);
-
-    lock_acquire(&filesys_lock);
-    f->eax = filesys_create(file, initial_size);
-    lock_release(&filesys_lock);
+  case SYS_CREATE:
+    validate_args(args, 2);
+    f->eax = sys_create((const char *)args[1], (off_t)args[2]);
     break;
-  }
 
-  case SYS_REMOVE: {
-    validate_args(f->esp, 1);
-    const char *file = *(const char **)((char *)f->esp + 4);
-
-    if (!is_valid_string(file))
-      sys_exit(-1);
-
-    lock_acquire(&filesys_lock);
-    f->eax = filesys_remove(file);
-    lock_release(&filesys_lock);
+  case SYS_REMOVE:
+    validate_args(args, 1);
+    f->eax = sys_remove((const char *)args[1]);
     break;
-  }
 
-  case SYS_OPEN: {
-    validate_args(f->esp, 1);
-    const char *file = *(const char **)((char *)f->esp + 4);
-
-    if (!is_valid_string(file))
-      sys_exit(-1);
-
-    lock_acquire(&filesys_lock);
-    struct file *opened = filesys_open(file);
-    lock_release(&filesys_lock);
-
-    if (opened == NULL) {
-      f->eax = -1;
-    } else {
-      int fd = allocate_fd(opened);
-      if (fd == -1) {
-        lock_acquire(&filesys_lock);
-        file_close(opened);
-        lock_release(&filesys_lock);
-        f->eax = -1;
-      } else {
-        f->eax = fd;
-      }
-    }
+  case SYS_OPEN:
+    validate_args(args, 1);
+    f->eax = sys_open((const char *)args[1]);
     break;
-  }
 
-  case SYS_FILESIZE: {
-    validate_args(f->esp, 1);
-    int fd = *(int *)((char *)f->esp + 4);
-    struct file *f_obj = get_file(fd);
-
-    if (f_obj == NULL) {
-      f->eax = -1;
-    } else {
-      lock_acquire(&filesys_lock);
-      f->eax = file_length(f_obj);
-      lock_release(&filesys_lock);
-    }
+  case SYS_FILESIZE:
+    validate_args(args, 1);
+    f->eax = sys_filesize((int)args[1]);
     break;
-  }
 
-  case SYS_READ: {
-    validate_args(f->esp, 3);
-    int fd = *(int *)((char *)f->esp + 4);
-    void *buffer = *(void **)((char *)f->esp + 8);
-    unsigned size = *(unsigned *)((char *)f->esp + 12);
-
-    if (!is_valid_buffer(buffer, size))
-      sys_exit(-1);
-
-    if (fd == 0) {
-      /* STDIN: keyboard read */
-      uint8_t *buf = (uint8_t *)buffer;
-      unsigned i;
-      for (i = 0; i < size; i++)
-        buf[i] = input_getc();
-      f->eax = size;
-    } else if (fd == 1) {
-      f->eax = -1;
-    } else {
-      struct file *f_obj = get_file(fd);
-      if (f_obj == NULL) {
-        f->eax = -1;
-      } else {
-        lock_acquire(&filesys_lock);
-        f->eax = file_read(f_obj, buffer, size);
-        lock_release(&filesys_lock);
-      }
-    }
+  case SYS_READ:
+    validate_args(args, 3);
+    f->eax = sys_read((int)args[1], (void *)args[2], (unsigned)args[3]);
     break;
-  }
 
-  case SYS_WRITE: {
-    validate_args(f->esp, 3);
-    int fd = *(int *)((char *)f->esp + 4);
-    const void *buffer = *(const void **)((char *)f->esp + 8);
-    unsigned size = *(unsigned *)((char *)f->esp + 12);
-
-    if (!is_valid_buffer(buffer, size))
-      sys_exit(-1);
-
-    if (fd == 1) {
-      putbuf(buffer, size);
-      f->eax = size;
-    } else if (fd == 0) {
-      f->eax = -1;
-    } else {
-      struct file *f_obj = get_file(fd);
-      if (f_obj == NULL) {
-        f->eax = -1;
-      } else {
-        lock_acquire(&filesys_lock);
-        f->eax = file_write(f_obj, buffer, size);
-        lock_release(&filesys_lock);
-      }
-    }
+  case SYS_WRITE:
+    validate_args(args, 3);
+    f->eax = sys_write((int)args[1], (const void *)args[2], (unsigned)args[3]);
     break;
-  }
 
-  case SYS_SEEK: {
-    validate_args(f->esp, 2);
-    int fd = *(int *)((char *)f->esp + 4);
-    unsigned position = *(unsigned *)((char *)f->esp + 8);
-    struct file *f_obj = get_file(fd);
-
-    if (f_obj != NULL) {
-      lock_acquire(&filesys_lock);
-      file_seek(f_obj, position);
-      lock_release(&filesys_lock);
-    }
+  case SYS_SEEK:
+    validate_args(args, 2);
+    sys_seek((int)args[1], (unsigned)args[2]);
     break;
-  }
 
-  case SYS_TELL: {
-    validate_args(f->esp, 1);
-    int fd = *(int *)((char *)f->esp + 4);
-    struct file *f_obj = get_file(fd);
-
-    if (f_obj == NULL) {
-      f->eax = -1;
-    } else {
-      lock_acquire(&filesys_lock);
-      f->eax = file_tell(f_obj);
-      lock_release(&filesys_lock);
-    }
+  case SYS_TELL:
+    validate_args(args, 1);
+    f->eax = sys_tell((int)args[1]);
     break;
-  }
 
-  case SYS_CLOSE: {
-    validate_args(f->esp, 1);
-    int fd = *(int *)((char *)f->esp + 4);
-
-    if (fd >= 2 && fd < MAX_FD) {
-      struct thread *cur = thread_current();
-      struct file *f_obj = cur->fd_table[fd];
-      if (f_obj != NULL) {
-        cur->fd_table[fd] = NULL;
-        lock_acquire(&filesys_lock);
-        file_close(f_obj);
-        lock_release(&filesys_lock);
-      }
-    }
+  case SYS_CLOSE:
+    validate_args(args, 1);
+    sys_close((int)args[1]);
     break;
-  }
 
   default:
     sys_exit(-1);

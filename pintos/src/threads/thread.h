@@ -32,6 +32,7 @@ struct child_status {
   bool load_success;          /* Did the child load successfully? */
   struct semaphore load_sema; /* Synchronizes parent exec with child load. */
   struct semaphore wait_sema; /* Synchronizes parent wait with child exit. */
+  struct lock ref_lock;       /* Synchronizes reference count changes. */
   struct list_elem elem;      /* Element in parent's children list. */
   int ref_count;              /* Reference count (parent and child). */
 };

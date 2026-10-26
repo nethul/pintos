@@ -27,3 +27,10 @@ cscope.files::
 
 cscope:: cscope.files
 	cscope -b -q -k
+
+submission:
+	@echo "Packaging Pintos Project 2 submission for 240449A..."
+	git archive --format=zip -o ../240449A_Lab2_submission.zip HEAD
+	git archive --format=tar.gz -o ../240449A_Lab2_submission.tar.gz HEAD
+	@echo "SUCCESS: Created ../240449A_Lab2_submission.zip and ../240449A_Lab2_submission.tar.gz"
+

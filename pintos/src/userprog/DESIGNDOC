@@ -1,536 +1,311 @@
-# Design Document — Pintos Project 2: User Programs
+		     +--------------------------+
+		     |		CS 2043		|
+		     | PROJECT 2: USER PROGRAMS	|
+		     | 	   DESIGN DOCUMENT     	|
+		     +--------------------------+
 
-**Course:** CS2042 / CS2043 — Operating Systems  
-**Project:** User Programs (Lab 2)  
-**Name / Student ID:** Nanayakkara N.S / 240449A  
-**Date:** October 2026
+---- GROUP ----
 
----
+>> Fill in the names and email addresses of your group members.
 
-## 1. Overview
+Nanayakkara N.S. <240449A@uom.lk>
 
-Pintos already loads ELF executables, but user programs cannot pass arguments, safely interact with kernel memory, terminate cleanly, wait for children, or use files. This project adds:
+---- PRELIMINARIES ----
 
-1. Command-line argument passing.
-2. Safe access to user memory from system calls.
-3. System-call dispatch and implementation.
-4. Process termination messages.
-5. Process creation, execution, waiting, and exit-status propagation.
-6. File-system system calls with per-process file descriptors.
-7. Synchronization around the provided, unsynchronized file system.
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
 
-The implementation is concentrated in `userprog/process.c`, `userprog/process.h`, `userprog/syscall.c`, `userprog/syscall.h`, and `userprog/exception.c`.
+All 80/80 test cases pass with a 100.0% score on `make grade`.
 
----
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course staff.
 
-## 2. Argument Passing
+1. Course laboratory specification: User Programs — CS2042/CS2043 Operating Systems (User_Programs-Lab2_new.pdf).
+2. Stanford Pintos documentation & project specification: https://www.scs.stanford.edu/23wi-cs212/pintos/pintos_3.html.
+3. System V Application Binary Interface (Intel386 Architecture Processor Supplement) for 32-bit x86 stack frame conventions.
 
-### Requirement
+			   ARGUMENT PASSING
+			   ================
 
-`process_execute("grep foo bar")` must start `grep` with arguments `foo` and `bar`. Repeated spaces are treated as one delimiter. The command line is limited to a reasonable size, such as one 4 KiB page.
+---- DATA STRUCTURES ----
 
-### Design
+>> A1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
 
-- Copy the command-line string into kernel memory or a temporary buffer before parsing it, because `process_execute()` receives a user/kernel string that must remain valid while the child starts.
-- Tokenize the command line using `strtok_r()` from `lib/string.c`, using space as the delimiter.
-- Use the first token as the executable name passed to `process_execute()`/`start_process()`.
-- Pass the remaining tokens to the child through the child’s initial stack.
+In `userprog/process.c`:
+```c
+#define MAX_ARGS 64
 
-### Stack setup
-
-In `setup_stack()`, arguments are pushed in the conventional 32-bit x86 order:
-
-1. Push each argument string, including its terminating null byte.
-2. Record the address of each string.
-3. Apply word alignment so that the final stack pointer is 4-byte aligned.
-4. Push a null `argv[argc]` sentinel.
-5. Push the argument addresses in reverse order, so `argv[0]` is at the lowest address among them.
-6. Push `argv`.
-7. Push `argc`.
-8. Push a fake return address (`0`).
-
-The final `esp` points to `argc`; the user program startup code then treats the stack as a normal C `main(int argc, char *argv[])` invocation.
-
-### Justification
-
-- **Copying before parsing** prevents races or invalid-pointer problems if the caller’s buffer changes or is freed.
-- **`strtok_r()`** is reentrant and already provided by Pintos, so it avoids introducing a custom parser.
-- **Pushing strings first, then pointers** is necessary because the pointers must refer to final stack addresses.
-- **A 4 KiB argument limit** keeps the initial stack within one page and avoids unbounded stack usage.
-
-### Files changed
-
-- `userprog/process.c`: command-line parsing and stack construction.
-- `userprog/process.h`: any helper declarations, if used.
-
----
-
-## 3. User Memory Access
-
-### Requirement
-
-System calls receive pointers created by user programs. These pointers may be null, unmapped, partially invalid, or point into kernel memory. Invalid accesses must terminate only the offending process, never panic or corrupt the kernel.
-
-### Design
-
-The implementation validates every user pointer before the kernel dereferences it.
-
-For a pointer to be valid:
-
-- It must be non-null.
-- It must be below `PHYS_BASE`.
-- Every byte in the object being accessed must be mapped in the current process’s page directory.
-
-For a buffer of length `n`, validation checks the first and last byte and, where appropriate, every page boundary crossed by the buffer. This catches buffers that begin in valid memory but extend into an unmapped page.
-
-Validation uses `pagedir_get_page()` from `userprog/pagedir.c` together with `is_user_vaddr()` from `threads/vaddr.h`.
-
-### Justification
-
-- **Validate-then-access** is simpler to reason about than relying on page faults, especially for avoiding resource leaks.
-- It prevents kernel-mode dereferences of invalid addresses, which could otherwise cause a kernel panic.
-- Checking page boundaries is necessary because pointer validity is not guaranteed merely because the first byte is mapped.
-
-### Error behavior
-
-If validation fails, the system call terminates the calling process with exit status `-1` and prints the required termination message. Any locks, file descriptors, or allocated memory held by the process are released during process cleanup.
-
-### Files changed
-
-- `userprog/syscall.c`: Implemented pointer and memory buffer validation helpers (`is_valid_buffer`, `is_valid_string`, and `validate_args`) that ensure all accessed user memory pages are below `PHYS_BASE` and mapped in the current thread's page directory (`pagedir`), terminating invalid processes via `sys_exit(-1)`.
-- `userprog/exception.c`: Retained standard page fault exception handling through `kill()`, terminating offending user processes with exit code -1.
-
----
-
-## 4. System-Call Infrastructure
-
-### Requirement
-
-Implement the system-call handler in `userprog/syscall.c` and support the system calls specified by the lab.
-
-### Design
-
-When a user program executes `int $0x30`, control enters `syscall_handler()`.
-
-1. Read the system-call number from the user stack at `esp`.
-2. Validate the stack pointer and each argument location.
-3. Read arguments according to the calling convention: the first argument is at `esp + 1`, the second at `esp + 2`, and so on (32-bit words).
-4. Dispatch to a handler using a `switch` statement on the system-call number.
-5. Place the return value, if any, in `eax`.
-
-The supported calls are:
-
-| System call | Return value | Main validation |
-|---|---:|---|
-| `halt` | none | None; shuts down Pintos |
-| `exit(status)` | none | None |
-| `exec(cmd_line)` | `pid_t` | Valid user string |
-| `wait(pid)` | `int` | Valid pid |
-| `create(file, size)` | `bool` | Valid user string |
-| `remove(file)` | `bool` | Valid user string |
-| `open(file)` | `int` | Valid user string |
-| `filesize(fd)` | `int` | Valid fd |
-| `read(fd, buffer, size)` | `int` | Valid fd and writable user buffer |
-| `write(fd, buffer, size)` | `int` | Valid fd and readable user buffer |
-| `seek(fd, position)` | none | Valid fd |
-| `tell(fd)` | `unsigned` | Valid fd |
-| `close(fd)` | none | Valid fd |
-
-### Justification
-
-- A `switch` dispatcher is explicit, easy to extend for Projects 3 and 4, and avoids function-pointer complexity.
-- Reading arguments from the interrupted user stack follows the Pintos user-system-call convention.
-- Returning errors through `eax` preserves the interface expected by `lib/user/syscall.c`.
-
-### Files changed
-
-- `userprog/syscall.c`: Full implementation of all system calls with pointer validation, file descriptor lookups, and global filesystem lock synchronization.
-- `userprog/syscall.h`: Declaration of `syscall_init(void)`.
-
----
-
-## 5. Process Control
-
-### 5.1 Process termination messages
-
-Whenever a user process exits, whether through `exit()` or because of an exception, Pintos prints:
-
-```text
-<process name>: exit(<status>)
+struct process_starter {
+  struct child_status *cs;
+  char cmdline[PGSIZE - sizeof(struct child_status *)];
+};
 ```
+`struct process_starter`: Encapsulates the child status pointer and raw command-line string into a single allocated page passed safely to `start_process()`.
 
-The process name is the full executable name passed to `process_execute()`, without arguments. This message is not printed for ordinary kernel threads or for `halt`.
+---- ALGORITHMS ----
 
-### Justification
+>> A2: Briefly describe how you implemented argument parsing.  How do
+>> you arrange for the elements of argv[] to be in the right order?
+>> How do you avoid overflowing the stack page?
 
-The grading scripts rely on this exact format. Extra debugging output is removed before submission because it can confuse automated tests.
+1. Command-line parsing:
+   In `process_execute()`, a copy of the command-line string is placed into `starter->cmdline`. The program name (first token) is extracted using `strtok_r()` with space delimiters to name the thread in `thread_create()`.
+   Inside `start_process()`, `load()` tokenizes the command-line into distinct arguments using `strtok_r()`, storing string pointers in a local array `char *argv[MAX_ARGS]` and counting `argc`.
 
-### 5.2 `exec`
+2. Stack placement & ordering:
+   In `setup_stack()`, the stack pointer begins at `PHYS_BASE`:
+   - Argument strings are copied onto the stack in right-to-left order (`argv[argc - 1]` down to `argv[0]`). Their resulting user-virtual addresses are stored in a temporary array `arg_addrs[]`.
+   - The stack pointer is rounded down to a 4-byte boundary for word alignment: `sp = (uint8_t *)((uintptr_t)sp & ~3)`.
+   - A null pointer sentinel (`argv[argc] = NULL`) is pushed.
+   - Pointers to the argument strings are pushed in reverse order (`arg_addrs[argc - 1]` down to `arg_addrs[0]`). This places `argv[0]` at the lowest memory address in the array.
+   - The address of `argv[0]` (i.e. `argv` itself) is pushed.
+   - `argc` is pushed.
+   - A fake return address (dummy `NULL` pointer) is pushed.
+   - `*esp` is assigned to `sp`.
 
-`exec(cmd_line)` creates a child process and returns its pid.
+3. Avoiding stack overflow:
+   Pintos restricts the initial user stack to a single page (4 KiB). Before setting `*esp = sp`, `setup_stack()` checks:
+   `if (sp < (uint8_t *)PHYS_BASE - PGSIZE)`
+   If the total argument data exceeds one page, the function frees the allocated stack page, fails `load()`, and aborts process creation.
 
-Design:
+---- RATIONALE ----
 
-- Validate `cmd_line` pointer and ensure the string lies entirely in valid user virtual memory below `PHYS_BASE`.
-- In `process_execute()`, allocate a `struct process_starter` in a single 4 KiB kernel page (`palloc_get_page(0)`) containing both a pointer to the child status record and a copy of `cmd_line`.
-- Allocate `struct child_status` via `malloc()`. Initialize:
-  - `tid = TID_ERROR`
-  - `exit_status = -1`
-  - `exited = false`, `waited = false`, `load_success = false`
-  - `ref_count = 2` (1 reference owned by parent in `cur->children`, 1 reference owned by child in `cur->child_status`)
-  - `load_sema` initialized to 0
-  - `wait_sema` initialized to 0
-- Add `cs` to the parent’s `children` list before calling `thread_create()`.
-- Spawn the new thread executing `start_process()`. In `start_process()`:
-  - Set `cur->child_status = starter->cs` and `cur->child_status->tid = cur->tid`.
-  - Call `load(starter->cmdline, &if_.eip, &if_.esp)`.
-  - Record `cur->child_status->load_success = success`.
-  - Free the `starter` page (`palloc_free_page(starter)`).
-  - Signal the parent: `sema_up(&cur->child_status->load_sema)`.
-  - If `!success`, call `thread_exit()`.
-- The parent blocks on `sema_down(&cs->load_sema)`.
-- If loading failed (`!cs->load_success`), the parent removes `cs` from `cur->children`, drops its reference via `child_status_unref(cs)`, and returns `TID_ERROR` (`-1`). Otherwise, returns `tid`.
+>> A3: Why does Pintos implement strtok_r() but not strtok()?
 
-### Justification
+Standard `strtok()` stores its internal parsing state in a hidden static global pointer. In a multi-threaded operating system kernel where multiple threads may parse strings concurrently, calls to `strtok()` would corrupt each other's parsing state. `strtok_r()` is reentrant and thread-safe because the caller explicitly provides a context pointer (`char **save_ptr`) to store the tokenizer state.
 
-- Allocating a dedicated `starter` block eliminates race conditions where the command line or child status might be read after the caller modifies or frees memory.
-- The load semaphore guarantees that `exec()` never returns a PID for a process that fails to load its executable.
-- Discarding the failed child status immediately prevents orphaned descriptors or status records from accumulating.
+>> A4: In Pintos, the kernel separates commands into a executable name
+>> and arguments.  In Unix-like systems, the shell does this
+>> separation.  Identify at least two advantages of the Unix approach.
 
-### 5.3 `wait`
+1. User-Level Fault Isolation & Performance:
+   Shell-side parsing handles command validation, syntax checking, quotes, and wildcard expansion entirely in user space. Malformed commands or non-existent files are rejected before invoking expensive kernel context switches, memory allocation, and thread creation.
 
-`wait(pid)` waits for a direct child and returns its exit status.
+2. Minimal Kernel Attack Surface:
+   The kernel `execve()` system call accepts a pre-tokenized `char *argv[]` array rather than a raw command-line string. This eliminates complex string parsing from privileged ring 0, reducing kernel vulnerability to buffer overflows or delimiter injection attacks.
 
-Design:
+			     SYSTEM CALLS
+			     ============
 
-- Each process maintains a `children` list of `struct child_status`.
-- `process_wait()` searches exclusively within the calling thread's `cur->children` list.
-- If `pid` is not found (i.e. not a direct child, or a grandchild, or a foreign process), or if `cs->waited == true`, return `-1` immediately.
-- Mark `cs->waited = true`.
-- Block on `sema_down(&cs->wait_sema)`. (If the child already terminated, the semaphore value is 1, so `sema_down` returns immediately without sleeping).
-- Read `status = cs->exit_status`.
-- Remove `cs` from `cur->children` and release the parent's reference via `child_status_unref(cs)`.
-- Return `status`.
+---- DATA STRUCTURES ----
 
-If the child process was terminated by an unhandled kernel exception rather than `exit()`, `exception.c` sets `cur->exit_status = -1`, ensuring `wait()` returns `-1`.
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
 
-### Justification
-
-- **Reference Counting with `ref_lock`:** Guarantees thread-safe resource reclamation with zero memory leaks regardless of termination ordering:
-  - Each `child_status` contains a `ref_lock` that serializes access to `ref_count`.
-  - When a parent or child drops its reference, it acquires `ref_lock`, decrements `ref_count`, and frees `cs` only if `ref_count == 0`.
-  - If parent waits on child: child decrements ref_count on exit (to 1); parent decrements ref_count in `process_wait()` (to 0) and frees `cs`.
-  - If parent exits before child: parent frees all children in `cur->children` (dropping references to 1); child decrements ref_count on exit (to 0) and frees `cs`.
-  - If parent never waits on child: child drops reference on exit (to 1); parent drops reference in `process_exit()` (to 0) and frees `cs`.
-- **Direct Child Lookup:** Searching only `cur->children` strictly enforces the rule that processes cannot wait on grandchildren or unrelated processes.
-- **`waited` Flag & Removal:** Prevents a parent from waiting on the same child more than once.
-
-### 5.4 `exit`
-
-`exit(status)` records the status in `cur->exit_status`, closes all per-process file descriptors, releases the executable lock, signals waiting parents, and terminates the thread.
-
-Cleanup sequence in `process_exit()`:
-1. Print process termination message: `<name>: exit(<status>)`.
-2. Close all open file descriptors (fd 2..127) while acquiring `filesys_lock`.
-3. If `exec_file` is set, call `file_allow_write(cur->exec_file)` and `file_close()`, releasing `filesys_lock`.
-4. Release `filesys_lock` if still held (in case of unexpected termination during I/O).
-5. Clean up all children in `cur->children` list by popping each element and calling `child_status_unref()`.
-6. If `cur->child_status != NULL`, set `exit_status = cur->exit_status`, set `exited = true`, call `sema_up(&cs->wait_sema)`, and drop child reference via `child_status_unref()`.
-7. Destroy the process's page directory (`pagedir_destroy()`) and switch back to base kernel page directory.
-
-### 5.5 Modern Toolchain Page-Size Alignment Fix
-
-When compiling 32-bit user binaries (`-m32`) using modern x86_64 toolchains (binutils `ld`), the default linker segment alignment defaults to 2 MiB (`max-page-size=0x200000`). This caused ELF binaries to contain ~72 pages of zero padding between headers and code, inflating test binaries from ~40 KiB to >340 KiB and exhausting Pintos's 4 MiB physical RAM pool during deep recursion (`multi-recurse`).
-
-By adding `-Wl,-z,max-page-size=4096 -Wl,--build-id=none` to `LDFLAGS` in `src/Makefile.userprog`, user binaries are generated with standard 4 KiB page alignment, reducing process memory footprints to 5 pages and allowing full recursive process execution without memory exhaustion.
-
-### Files changed
-
-- `userprog/process.c`: Implementation of `process_starter`, `child_status_unref()` (using `ref_lock`), `process_execute()`, `start_process()`, `process_wait()`, `process_exit()`, and stack initialization.
-- `userprog/process.h`: Declarations of `process_execute()`, `process_wait()`, `process_exit()`, and `process_activate()`.
-- `userprog/syscall.c`: Syscall dispatcher with dedicated helpers `sys_exec`, `sys_wait`, and `sys_exit`.
-- `threads/thread.h`: Added `struct child_status` (with `load_sema`, `wait_sema`, and `ref_lock`), extended `struct thread` with `children` list, `child_status`, `exit_status`, `fd_table[128]`, and `exec_file`.
-- `threads/thread.c`: Initialization of `children` list and userprog state in `init_thread()`.
-- `Makefile.userprog`: Added `-Wl,-z,max-page-size=4096 -Wl,--build-id=none` to `LDFLAGS`.
-
----
-
-## 6. File-System System Calls
-
-### Requirement
-
-Implement `create`, `remove`, `open`, `filesize`, `read`, `write`, `seek`, `tell`, and `close`, with independent per-process file descriptors.
-
-### Design
-
-Each process has its own file-descriptor table. File descriptors:
-
-- Reserve 0 for standard input and 1 for standard output.
-- Begin allocating from 2.
-- Are not inherited by child processes.
-- Are independent even when two descriptors refer to the same underlying file.
-- Are closed automatically when the owning process exits.
-
-A file-descriptor entry stores the `struct file *` returned by the file system and enough information to remove the entry safely.
-
-For console I/O:
-
-- `read(0, ...)` reads from the keyboard using `input_getc()`.
-- `write(1, ...)` writes the buffer using `putbuf()`.
-- Large console writes may be split into chunks so output from different processes is less likely to interleave.
-
-### Justification
-
-- Per-process descriptor tables match Unix-like semantics and prevent one process from closing another process’s file.
-- Storing `struct file *` separately for each open call preserves independent file offsets.
-- Using `putbuf()` for console output prevents character-by-character interleaving.
-- Closing descriptors during process exit prevents file-handle leaks.
-
-### Synchronization
-
-The provided file system has no internal synchronization. Therefore, every file-system operation is protected by a global file-system lock.
-
-The lock is acquired before calling functions such as `filesys_create()`, `filesys_remove()`, `filesys_open()`, `file_read()`, `file_write()`, `file_seek()`, `file_tell()`, `file_close()`, and the file operations used during executable loading. It is released after the operation completes, including on error paths.
-
-### Justification
-
-A global lock is coarse-grained but correct. Since the base file system is not thread-safe, finer-grained locking would require modifying `filesys/`, which the lab advises against for this project.
-
-### Files changed
-
-- `userprog/syscall.c`: Per-process file descriptor management (`allocate_fd`, `get_file`) and modular system call handlers (`sys_create`, `sys_remove`, `sys_open`, `sys_filesize`, `sys_read`, `sys_write`, `sys_seek`, `sys_tell`, `sys_close`) called from `syscall_handler()` via an argument array `uint32_t *args`, protected by the global `filesys_lock`.
-- `userprog/process.c`: Closing all open file descriptors in `cur->fd_table` (fds 2..127) and restoring executable write access (`file_allow_write(cur->exec_file)`) in `process_exit()`.
-- `threads/thread.h`: Added per-process file descriptor array `struct file *fd_table[128]` and running executable pointer `struct file *exec_file` to `struct thread`.
-- `threads/thread.c`: Initializing `fd_table` entries to `NULL` and `exec_file` to `NULL` in `init_thread()`.
-
----
-
-## 7. Synchronization and Safety
-
-### Locks and semaphores used
-
-| Mechanism | Purpose |
-|---|---|
-| Global file-system lock (`filesys_lock`) | Serializes all access to the unsynchronized base file system |
-| Load semaphore (`load_sema`) | Makes parent `exec()` wait for child load success/failure |
-| Per-child wait semaphore (`wait_sema`) | Makes parent `wait()` sleep until child exits |
-| Child status reference lock (`ref_lock`) | Protects `ref_count` updates during `child_status_unref()` |
-
-### Resource cleanup
-
-On process termination:
-
-- Close every open file descriptor.
-- Free the file-descriptor table.
-- Signal the parent’s wait semaphore.
-- Free child-status records that are no longer needed.
-- Ensure that the initial process’s termination prevents Pintos from powering off prematurely.
-
-### Justification
-
-Cleanup is performed in one termination path so that normal exits, failed loads, and exceptions behave consistently. This avoids leaked locks, files, memory, and child records.
-
----
-
-## 8. Testing Strategy
-
-Tests are run from `userprog/build` using:
-
-```sh
-make check
+In `threads/thread.h`:
+```c
+struct child_status {
+  tid_t tid;                  /* Child thread ID. */
+  int exit_status;            /* Exit status of the child. */
+  bool exited;                /* Has the child exited? */
+  bool waited;                /* Has the parent already waited for it? */
+  bool load_success;          /* Did the child load successfully? */
+  struct semaphore load_sema; /* Synchronizes parent exec with child load. */
+  struct semaphore wait_sema; /* Synchronizes parent wait with child exit. */
+  struct lock ref_lock;       /* Synchronizes reference count changes. */
+  struct list_elem elem;      /* Element in parent's children list. */
+  int ref_count;              /* Reference count (parent and child). */
+};
 ```
+`struct child_status`: Shared tracking record between parent and child for load synchronization, exit status propagation, waiting, and ref-counted lifetime management.
 
-Before running the full suite, `$SIMULATOR` is set to `qemu` in `pintos/src/tests/Make.tests`, as required by the lab.
-
-### Areas tested
-
-- Argument passing: multiple arguments, repeated spaces, long command lines, and programs that inspect `argv`.
-- User-memory safety: null pointers, kernel pointers, unmapped pointers, and buffers crossing page boundaries.
-- Process control: normal exit, exception termination, parent/child waiting, repeated waits, invalid waits, and orphaned processes.
-- File calls: create/open/read/write/seek/tell/close, invalid descriptors, and removing open files.
-- Concurrency: multiple processes using the file system and console simultaneously.
-
-### Test Results Summary
-
-#### Milestone 1: Argument Passing (100% Pass)
-- `tests/userprog/args-none` -> **PASS**
-- `tests/userprog/args-single` -> **PASS**
-- `tests/userprog/args-multiple` -> **PASS**
-- `tests/userprog/args-many` -> **PASS**
-- `tests/userprog/args-dbl-space` -> **PASS**
-
-#### Milestone 2 & 3: Process Exit Messages & Safe User-Memory Access (100% Pass)
-- `tests/userprog/sc-bad-sp` -> **PASS** (invalid %esp below code rejected)
-- `tests/userprog/sc-bad-arg` -> **PASS** (kernel-space argument rejected)
-- `tests/userprog/sc-boundary` -> **PASS** (syscall across boundary)
-- `tests/userprog/sc-boundary-2` -> **PASS** (syscall across boundary 2)
-- `tests/userprog/sc-boundary-3` -> **PASS** (partially invalid 4-byte syscall number rejected)
-- `tests/userprog/bad-read` -> **PASS** (null pointer read terminates with -1)
-- `tests/userprog/bad-write` -> **PASS** (unmapped write terminates with -1)
-- `tests/userprog/bad-read2` -> **PASS** (kernel read terminates with -1)
-- `tests/userprog/bad-write2` -> **PASS** (kernel write terminates with -1)
-- `tests/userprog/bad-jump` -> **PASS** (jump to 0 terminates with -1)
-- `tests/userprog/bad-jump2` -> **PASS** (jump to kernel terminates with -1)
-- `tests/userprog/create-null` -> **PASS** (null filename rejected)
-- `tests/userprog/create-bad-ptr` -> **PASS** (bad filename pointer rejected)
-- `tests/userprog/open-null` -> **PASS** (null filename rejected)
-- `tests/userprog/open-bad-ptr` -> **PASS** (bad filename pointer rejected)
-- `tests/userprog/exec-bad-ptr` -> **PASS** (bad command-line pointer rejected)
-
-#### Milestone 4 & 5: Basic & File-System System Calls (100% Pass)
-- `tests/userprog/create-normal` -> **PASS**
-- `tests/userprog/create-empty` -> **PASS**
-- `tests/userprog/create-null` -> **PASS**
-- `tests/userprog/create-bad-ptr` -> **PASS**
-- `tests/userprog/create-long` -> **PASS**
-- `tests/userprog/create-exists` -> **PASS**
-- `tests/userprog/create-bound` -> **PASS**
-- `tests/userprog/open-normal` -> **PASS**
-- `tests/userprog/open-missing` -> **PASS**
-- `tests/userprog/open-boundary` -> **PASS**
-- `tests/userprog/open-empty` -> **PASS**
-- `tests/userprog/open-null` -> **PASS**
-- `tests/userprog/open-bad-ptr` -> **PASS**
-- `tests/userprog/open-twice` -> **PASS**
-- `tests/userprog/close-normal` -> **PASS**
-- `tests/userprog/close-twice` -> **PASS**
-- `tests/userprog/close-stdin` -> **PASS**
-- `tests/userprog/close-stdout` -> **PASS**
-- `tests/userprog/close-bad-fd` -> **PASS**
-- `tests/userprog/read-normal` -> **PASS**
-- `tests/userprog/read-bad-ptr` -> **PASS**
-- `tests/userprog/read-boundary` -> **PASS**
-- `tests/userprog/read-zero` -> **PASS**
-- `tests/userprog/read-stdout` -> **PASS**
-- `tests/userprog/read-bad-fd` -> **PASS**
-- `tests/userprog/write-normal` -> **PASS**
-- `tests/userprog/write-bad-ptr` -> **PASS**
-- `tests/userprog/write-boundary` -> **PASS**
-- `tests/userprog/write-zero` -> **PASS**
-- `tests/userprog/write-stdin` -> **PASS**
-- `tests/userprog/write-bad-fd` -> **PASS**
-- `tests/userprog/rox-simple` -> **PASS** (read-only executable protection verified)
-- `tests/filesys/base/*` -> **PASS** (`lg-create`, `lg-full`, `lg-random`, `lg-seq-block`, `lg-seq-random`, `sm-create`, `sm-full`, `sm-random`, `sm-seq-block`, `sm-seq-random`, `syn-remove`)
-
-#### Milestone 6: Process Control, Parent-Child Synchronization & Stress (100% Pass)
-- `tests/userprog/exec-once` -> **PASS** (child executes and completes)
-- `tests/userprog/exec-arg` -> **PASS** (arguments parsed and verified in child)
-- `tests/userprog/exec-bound` -> **PASS** (exec string near page boundary)
-- `tests/userprog/exec-bound-2` -> **PASS** (exec string crossing page boundary)
-- `tests/userprog/exec-bound-3` -> **PASS** (exec string spanning boundary)
-- `tests/userprog/exec-multiple` -> **PASS** (multiple children spawned and waited)
-- `tests/userprog/exec-missing` -> **PASS** (nonexistent executable returns -1)
-- `tests/userprog/exec-bad-ptr` -> **PASS** (invalid executable pointer rejected)
-- `tests/userprog/wait-simple` -> **PASS** (parent waits for child exit status)
-- `tests/userprog/wait-twice` -> **PASS** (re-waiting on same child returns -1)
-- `tests/userprog/wait-killed` -> **PASS** (kernel-terminated child returns -1)
-- `tests/userprog/wait-bad-pid` -> **PASS** (waiting on invalid/non-child PID returns -1)
-- `tests/userprog/multi-recurse` -> **PASS** (15 levels of recursive exec and wait)
-- `tests/userprog/multi-child-fd` -> **PASS** (non-inheritance of file descriptors verified)
-- `tests/userprog/rox-child` -> **PASS** (executable write denial across parent and child)
-- `tests/userprog/rox-multichild` -> **PASS** (executable write denial with multiple children)
-- `tests/userprog/no-vm/multi-oom` -> **PASS** (10 successive waves of process exhaustion and memory reclamation with zero memory leaks)
-- `tests/filesys/base/syn-read` -> **PASS** (10 concurrent child readers synchronized)
-- `tests/filesys/base/syn-write` -> **PASS** (concurrent child writers serialized)
-
-#### Final Test Suite Execution (`make check`)
-- **Total Tests:** 80
-- **Passed:** 80
-- **Failed:** 0
-- **Pass Rate:** **100%**
-
-Passing tests log:
-```text
-pass tests/userprog/args-none
-pass tests/userprog/args-single
-pass tests/userprog/args-multiple
-pass tests/userprog/args-many
-pass tests/userprog/args-dbl-space
-pass tests/userprog/sc-bad-sp
-pass tests/userprog/sc-bad-arg
-pass tests/userprog/sc-boundary
-pass tests/userprog/sc-boundary-2
-pass tests/userprog/sc-boundary-3
-pass tests/userprog/halt
-pass tests/userprog/exit
-pass tests/userprog/create-normal
-pass tests/userprog/create-empty
-pass tests/userprog/create-null
-pass tests/userprog/create-bad-ptr
-pass tests/userprog/create-long
-pass tests/userprog/create-exists
-pass tests/userprog/create-bound
-pass tests/userprog/open-normal
-pass tests/userprog/open-missing
-pass tests/userprog/open-boundary
-pass tests/userprog/open-empty
-pass tests/userprog/open-null
-pass tests/userprog/open-bad-ptr
-pass tests/userprog/open-twice
-pass tests/userprog/close-normal
-pass tests/userprog/close-twice
-pass tests/userprog/close-stdin
-pass tests/userprog/close-stdout
-pass tests/userprog/close-bad-fd
-pass tests/userprog/read-normal
-pass tests/userprog/read-bad-ptr
-pass tests/userprog/read-boundary
-pass tests/userprog/read-zero
-pass tests/userprog/read-stdout
-pass tests/userprog/read-bad-fd
-pass tests/userprog/write-normal
-pass tests/userprog/write-bad-ptr
-pass tests/userprog/write-boundary
-pass tests/userprog/write-zero
-pass tests/userprog/write-stdin
-pass tests/userprog/write-bad-fd
-pass tests/userprog/exec-once
-pass tests/userprog/exec-arg
-pass tests/userprog/exec-bound
-pass tests/userprog/exec-bound-2
-pass tests/userprog/exec-bound-3
-pass tests/userprog/exec-multiple
-pass tests/userprog/exec-missing
-pass tests/userprog/exec-bad-ptr
-pass tests/userprog/wait-simple
-pass tests/userprog/wait-twice
-pass tests/userprog/wait-killed
-pass tests/userprog/wait-bad-pid
-pass tests/userprog/multi-recurse
-pass tests/userprog/multi-child-fd
-pass tests/userprog/rox-simple
-pass tests/userprog/rox-child
-pass tests/userprog/rox-multichild
-pass tests/userprog/bad-read
-pass tests/userprog/bad-write
-pass tests/userprog/bad-read2
-pass tests/userprog/bad-write2
-pass tests/userprog/bad-jump
-pass tests/userprog/bad-jump2
-pass tests/userprog/no-vm/multi-oom
-pass tests/filesys/base/lg-create
-pass tests/filesys/base/lg-full
-pass tests/filesys/base/lg-random
-pass tests/filesys/base/lg-seq-block
-pass tests/filesys/base/lg-seq-random
-pass tests/filesys/base/sm-create
-pass tests/filesys/base/sm-full
-pass tests/filesys/base/sm-random
-pass tests/filesys/base/sm-seq-block
-pass tests/filesys/base/sm-seq-random
-pass tests/filesys/base/syn-read
-pass tests/filesys/base/syn-remove
-pass tests/filesys/base/syn-write
-All 80 tests passed.
+In `struct thread` (`threads/thread.h`):
+```c
+#ifdef USERPROG
+  uint32_t *pagedir;                 /* Page directory. */
+  int exit_status;                   /* Process termination exit status. */
+  struct file *fd_table[128];        /* Per-process file descriptor table. */
+  struct file *exec_file;            /* Running executable file (write denied). */
+  struct list children;              /* List of direct child_status structures. */
+  struct child_status *child_status; /* Shared status record with parent. */
+#endif
 ```
+- `exit_status`: Exit code recorded by `sys_exit()` or kernel exception.
+- `fd_table[128]`: Maps process-local file descriptors (2..127) to open `struct file` pointers.
+- `exec_file`: Open file pointer for the running executable, held with write denied.
+- `children`: List of `struct child_status` records for this thread's direct children.
+- `child_status`: Pointer to this thread's own `child_status` record held by its parent.
 
----
+In `userprog/syscall.h` / `userprog/syscall.c`:
+```c
+extern struct lock filesys_lock;
+```
+`filesys_lock`: Global mutual exclusion lock serializing all operations across the thread-unsafe Pintos base file system.
 
-## 9. References
+>> B2: Describe how file descriptors are associated with open files.
+>> Are file descriptors unique within the entire OS or just within a
+>> single process?
 
-I consulted the following official resources to understand the project requirements, x86 calling conventions, and system call specifications:
+File descriptors are associated with open files via the thread's private `fd_table` array (`struct file *fd_table[128]`). 
+- Descriptors 0 and 1 are reserved for standard input and standard output, respectively.
+- When `sys_open()` opens a file, `allocate_fd()` iterates from index 2 to 127 and assigns the first `NULL` entry to the returned `struct file *`.
+- File descriptors are unique **only within a single process**, not across the entire OS. Two separate processes can have descriptor 2 open concurrently, each indexing their own independent file objects and file offsets.
 
-- Course laboratory specification: **User Programs — CS2042/CS2043 Operating Systems** (`User_Programs-Lab2_new.pdf`).
-- Stanford University Pintos documentation and project specifications: <https://www.scs.stanford.edu/23wi-cs212/pintos/pintos_3.html>.
-- System V ABI Intel386 Architecture Processor Supplement for the 32-bit x86 stack layout, alignment rules, and calling convention.
-- Pintos source code and internal headers (`threads/vaddr.h`, `userprog/pagedir.h`, `filesys/filesys.h`, `filesys/file.h`, and `lib/string.h`).
+---- ALGORITHMS ----
+
+>> B3: Describe your code for reading and writing user data from the
+>> kernel.
+
+User memory validation is performed prior to any dereference:
+1. `is_valid_buffer(buffer, size)`:
+   - Verifies `buffer` is non-NULL (when `size > 0`).
+   - Ensures `(uintptr_t)buffer + size` does not wrap around (integer overflow check).
+   - Confirms start and end addresses are below `PHYS_BASE` via `is_user_vaddr()`.
+   - Iterates through every virtual page boundary between `pg_round_down(buffer)` and `buffer + size - 1`, calling `pagedir_get_page(thread_current()->pagedir, page)` to ensure each page is mapped in user memory.
+2. `is_valid_string(str)`:
+   - Ensures `str` is non-NULL and below `PHYS_BASE`.
+   - Traverses byte-by-byte verifying each byte is below `PHYS_BASE` and mapped in `pagedir` until the terminating `'\0'` is encountered.
+3. Reading/Writing:
+   - Console: For fd 0, `sys_read()` reads keystrokes using `input_getc()`. For fd 1, `sys_write()` writes through `putbuf()`.
+   - Files: For fd >= 2, the file pointer is retrieved from `fd_table`. The operation acquires `filesys_lock`, invokes `file_read()` or `file_write()`, and releases `filesys_lock`.
+
+>> B4: Suppose a system call causes a full page (4,096 bytes) of data
+>> to be copied from user space into the kernel.  What is the least
+>> and the greatest possible number of inspections of the page table
+>> (e.g. calls to pagedir_get_page()) that might result?  What about
+>> for a system call that only copies 2 bytes of data?  Is there room
+>> for improvement in these numbers, and how much?
+
+1. For a full 4,096-byte copy:
+   - Least possible inspections: 1 inspection. This occurs if the buffer is exactly page-aligned (e.g. starting at offset 0 of a virtual page), so the entire 4,096 bytes fit within that single page.
+   - Greatest possible inspections: 2 inspections. If the buffer is not page-aligned (e.g. starts at offset 4), it straddles two consecutive virtual pages, requiring inspection of both pages.
+
+2. For a 2-byte copy:
+   - Least possible inspections: 1 inspection. If both bytes reside in the same page (offsets 0..4094).
+   - Greatest possible inspections: 2 inspections. If the 2 bytes span across a 4 KiB page boundary (byte 0 at offset 4095 of page N, and byte 1 at offset 0 of page N+1).
+
+3. Room for improvement:
+   Yes, significantly. Instead of inspecting the software page tables via `pagedir_get_page()` prior to every transfer, the kernel can access user memory directly using inline assembly (`get_user` / `put_user`) and rely on the CPU's MMU hardware. If an address is invalid, the MMU triggers a page fault, which `page_fault()` catches and handles by terminating the process. This eliminates software page table lookups entirely (reducing overhead to 0 software inspections in the common path).
+
+>> B5: Briefly describe your implementation of the "wait" system call
+>> and how it interacts with process termination.
+
+1. When parent calls `sys_wait(pid)`:
+   - `process_wait()` searches `cur->children` for a `child_status` record matching `pid`.
+   - If not found (not a direct child) or if `cs->waited` is already true, it returns -1 immediately.
+   - It sets `cs->waited = true` and blocks by calling `sema_down(&cs->wait_sema)`.
+2. When the child process terminates:
+   - In `process_exit()`, the child sets its `cur->child_status->exit_status = cur->exit_status` and marks `exited = true`.
+   - It unblocks the parent via `sema_up(&cs->wait_sema)`.
+   - It decrements its reference to `cs` via `child_status_unref(cs)` and cleans up its own resources.
+3. Waking up:
+   - The parent wakes from `sema_down()`, reads `cs->exit_status`, removes `cs` from `cur->children`, drops its own reference via `child_status_unref(cs)`, and returns the status.
+
+>> B6: Any access to user program memory at a user-specified address
+>> can fail due to a bad pointer value.  Such accesses must cause the
+>> process to be terminated.  System calls are fraught with such
+>> accesses, e.g. a "write" system call requires reading the system
+>> call number from the user stack, then each of the call's three
+>> arguments, then an arbitrary amount of user memory, and any of
+>> these can fail at any point.  This poses a design and
+>> error-handling problem: how do you best avoid obscuring the primary
+>> function of code in a morass of error-handling?  Furthermore, when
+>> an error is detected, how do you ensure that all temporarily
+>> allocated resources (locks, buffers, etc.) are freed?  In a few
+>> paragraphs, describe the strategy or strategies you adopted for
+>> managing these issues.  Give an example.
+
+We separate error handling into two distinct architectural tiers: proactive early validation at the boundary, and centralized cleanup in `process_exit()`.
+
+First, `syscall_handler()` avoids deep nested checks by validating all input arguments up front before any system call logic or lock acquisition begins. When `syscall_handler()` is entered, it verifies that `f->esp` points to valid memory. It casts `f->esp` to `uint32_t *args` and reads `args[0]` (the syscall number). In each switch case, a single call to `validate_args(args, argc)` validates all stack argument words in one contiguous check. String arguments and I/O buffers are validated using `is_valid_string()` or `is_valid_buffer()` before any kernel lock or resource is acquired. If validation fails, `sys_exit(-1)` is called immediately without messy partial rollbacks.
+
+Second, resource reclamation is centralized entirely in `process_exit()`. Because every termination path (normal exit, syscall validation failure via `sys_exit(-1)`, or unhandled exception in `exception.c`) must execute `thread_exit()` -> `process_exit()`, `process_exit()` acts as the single cleanup barrier:
+- It closes all open file descriptors in `fd_table` (fds 2..127).
+- It re-allows writes to `cur->exec_file` and closes it.
+- It checks `if (lock_held_by_current_thread(&filesys_lock)) lock_release(&filesys_lock);`, guaranteeing the global file system lock is never left orphaned.
+- It unrefs all child status records and unblocks any waiting parent.
+
+Example: If `write(fd, bad_buffer, size)` is invoked with an unmapped buffer, `sys_write()` validates `bad_buffer` with `is_valid_buffer()` before calling `lock_acquire(&filesys_lock)`. The failure triggers `sys_exit(-1)` immediately, ensuring zero acquired locks or allocated descriptors need unwinding.
+
+---- SYNCHRONIZATION ----
+
+>> B7: The "exec" system call returns -1 if loading the new executable
+>> fails, so it cannot return before the new executable has completed
+>> loading.  How does your code ensure this?  How is the load
+>> success/failure status passed back to the thread that calls "exec"?
+
+Synchronization is handled by `load_sema` inside `struct child_status`:
+1. `process_execute()` allocates a `struct child_status` initialized with `load_success = false` and `sema_init(&cs->load_sema, 0)`.
+2. It packs `cs` and the command line into `starter` and calls `thread_create()`.
+3. The parent immediately blocks on `sema_down(&cs->load_sema)`.
+4. The child thread begins in `start_process()`, unpacks `starter`, sets `cur->child_status = starter->cs`, and executes `load()`.
+5. The child sets `cur->child_status->load_success = success`, frees `starter`, and calls `sema_up(&cur->child_status->load_sema)`. If loading failed, the child terminates with `thread_exit()`.
+6. The parent wakes up from `sema_down()`. It inspects `cs->load_success`: if false, it removes `cs` from `children`, drops its reference via `child_status_unref(cs)`, and returns `TID_ERROR` (-1); if true, it returns `cs->tid`.
+
+>> B8: Consider parent process P with child process C.  How do you
+>> ensure proper synchronization and avoid race conditions when P
+>> calls wait(C) before C exits?  After C exits?  How do you ensure
+>> that all resources are freed in each case?  How about when P
+>> terminates without waiting, before C exits?  After C exits?  Are
+>> there any special cases?
+
+Each child status record uses reference counting (`ref_count = 2`, one for parent and one for child) protected by `ref_lock`, along with `wait_sema` initialized to 0:
+
+- Case 1: P calls `wait(C)` before C exits:
+  P calls `sema_down(&cs->wait_sema)` and sleeps. When C exits, C writes its exit code to `cs->exit_status`, marks `cs->exited = true`, calls `sema_up(&cs->wait_sema)`, and calls `child_status_unref(cs)` (lowering `ref_count` from 2 to 1). P wakes up, reads `cs->exit_status`, removes `cs` from `cur->children`, calls `child_status_unref(cs)` (lowering `ref_count` from 1 to 0), and frees `cs`.
+
+- Case 2: P calls `wait(C)` after C exits:
+  C already exited, stored `exit_status`, called `sema_up(&wait_sema)` (semaphore value becomes 1), and dropped its reference (`ref_count` becomes 1). When P calls `wait(C)`, `sema_down(&cs->wait_sema)` succeeds immediately without blocking. P reads `exit_status`, calls `child_status_unref(cs)` (`ref_count` becomes 0), and frees `cs`.
+
+- Case 3: P terminates without waiting, before C exits:
+  When P exits, `process_exit()` iterates through `cur->children` and calls `child_status_unref()` on all child status records (`ref_count` drops from 2 to 1). When C later terminates, C calls `child_status_unref()` (`ref_count` drops from 1 to 0) and frees `cs`.
+
+- Case 4: P terminates without waiting, after C exits:
+  C already dropped its reference upon exit (`ref_count` = 1). When P exits, `process_exit()` drops P's reference (`ref_count` drops from 1 to 0) and frees `cs`.
+
+Special cases handled:
+- Repeated `wait(C)` calls: `cs->waited` flag ensures subsequent calls immediately return -1.
+- Waiting on non-children / grandchildren: P strictly searches its own `cur->children` list, rejecting foreign PIDs with -1.
+
+---- RATIONALE ----
+
+>> B9: Why did you choose to implement access to user memory from the
+>> kernel in the way that you did?
+
+We selected the validate-then-access verification approach (`is_valid_buffer` and `is_valid_string`) using `pagedir_get_page()` and `is_user_vaddr()`. 
+Reasons:
+1. Robustness & Predictable Control Flow: Explicit verification before dereference guarantees that invalid user pointers never trigger kernel-mode page faults.
+2. Clean Lock Invariants: Because validation occurs before acquiring `filesys_lock` or allocating resources, error exits never risk leaking locks or leaving shared data structures partially modified.
+3. Maintainability: The logic is written entirely in portable C without architecture-dependent inline assembly page fault fixup tables.
+
+>> B10: What advantages or disadvantages can you see to your design
+>> for file descriptors?
+
+- Advantages:
+  1. O(1) Access Time: Fixed-size direct indexing (`cur->fd_table[fd]`) provides immediate access without list traversals.
+  2. Zero Dynamic Heap Allocation: The table is embedded directly within `struct thread`, eliminating `malloc()` overhead during `open()`.
+  3. Simple Cleanup: Closing all open files at process exit is a simple linear iteration over 126 array entries.
+- Disadvantages:
+  1. Static Descriptor Limit: The process can open at most 126 concurrent files (`MAX_FD = 128`).
+  2. Fragmentation Search: Descriptor allocation performs a linear scan for the lowest free slot, though with $N \le 128$ the CPU cost is negligible.
+
+>> B11: The default tid_t to pid_t mapping is the identity mapping.
+>> If you changed it, what advantages are there to your approach?
+
+We retained the identity mapping (`pid_t == tid_t`). In Pintos Project 2, each user process consists of exactly one kernel thread. An identity mapping is optimal because:
+1. It eliminates the overhead and complexity of maintaining a global process table or pid-to-thread hash map.
+2. Thread IDs already provide unique 32-bit positive integers managed by the thread allocator.
+A non-identity mapping would only be advantageous in Project 3/4 if supporting multithreaded processes (where multiple threads share a single process ID), which Pintos does not require.
+
+			   SURVEY QUESTIONS
+			   ================
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+
+The assignment is well-balanced. Handling process synchronization and pointer safety across page boundaries required careful attention to detail.
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+Implementing the System V calling convention in `setup_stack()` and synchronizing parent-child process lifetimes via reference-counted status blocks gave deep insight into real-world OS process management.
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+Emphasize early that modern 64-bit host toolchains (`ld`) default to 2 MiB page alignment when generating 32-bit user binaries (`-m32`), which can exhaust Pintos RAM during recursion unless `-Wl,-z,max-page-size=4096` is specified.

@@ -8,7 +8,7 @@
 
 >> Fill in the names and email addresses of your group members.
 
-Nanayakkara N.S. <240449A@uom.lk>
+Nanayakkara N.S. <240449A>
 
 ---- PRELIMINARIES ----
 
